@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' https://ptzmfrwjzfeslcqyjunb.supabase.co wss://ptzmfrwjzfeslcqyjunb.supabase.co; worker-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
 <title>عملاء توتال</title>
 <meta name="description" content="نظام متابعة عملاء توتال لإدارة المرافق">
 <meta name="author" content="رامي هادي رياني">
@@ -46,6 +48,17 @@
     <button class="btn ghost" id="pendingOut">تسجيل الخروج</button>
   </div>
 </section>
+<section class="auth" id="mfaView" hidden>
+  <form class="auth-card" id="mfaForm" novalidate>
+    <img class="logo" src="icons/logo.png" alt="توتال لإدارة المرافق">
+    <h2>التحقق بخطوتين</h2>
+    <p class="note" style="text-align:center">افتح تطبيق المصادقة على جوالك (مثل Google Authenticator) واكتب الرمز المكوّن من 6 أرقام.</p>
+    <div class="field"><label for="mfaCode">رمز التحقق</label><input id="mfaCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" dir="ltr" style="text-align:center;font-size:22px;letter-spacing:.3em"></div>
+    <button class="btn" type="submit" id="mfaBtn">تحقّق</button>
+    <div class="status" id="mfaSt" role="status"></div>
+    <button type="button" class="linkbtn" id="mfaOut" style="align-self:center">تسجيل الخروج</button>
+  </form>
+</section>
 <section class="auth" id="newPassView" hidden>
   <form class="auth-card" id="newPassForm">
     <img class="logo" src="icons/logo.png" alt="توتال لإدارة المرافق">
@@ -69,7 +82,7 @@
     </div>
     <div class="hdr-side">
       <div class="org" id="today"></div>
-      <div class="who"><span id="me"></span><button class="btn ghost" id="logout">خروج</button></div>
+      <div class="who"><span id="me"></span><button class="btn ghost" id="account">حسابي والأمان</button><button class="btn ghost" id="logout">خروج</button></div>
       <div class="tools">
         <select id="rpScope" aria-label="نطاق التقرير"><option value="all">تقرير كامل</option><option value="open">العملاء المفتوحون</option><option value="queue">المتابعات المستحقة</option></select>
         <button class="btn" id="rpBtn">تقرير PDF</button>
@@ -91,6 +104,7 @@
     <button role="tab" aria-selected="false" data-tab="deals">كل العملاء</button>
     <button role="tab" aria-selected="false" data-tab="log">سجل النشاط</button>
     <button role="tab" aria-selected="false" data-tab="team" id="teamTab" hidden>الفريق</button>
+    <button role="tab" aria-selected="false" data-tab="audit" id="auditTab" hidden>سجل المراقبة</button>
   </nav>
 
   <section id="p-queue">
@@ -117,11 +131,35 @@
 
   <section id="p-team" hidden>
     <div class="box">
+      <h4>دعوة موظف</h4>
+      <p class="note">التسجيل في التطبيق بدعوة فقط. أضف بريد الموظف هنا، ثم أرسل له رابط التطبيق ليضغط «حساب جديد» بنفس البريد. يُفعَّل حسابه تلقائياً بعد تأكيد بريده.</p>
+      <div class="three">
+        <div class="field"><label for="invName">الاسم</label><input id="invName"></div>
+        <div class="field"><label for="invEmail">البريد الإلكتروني</label><input id="invEmail" type="email" dir="ltr"></div>
+        <div></div>
+        <button class="btn" id="invAdd">إرسال الدعوة</button>
+      </div>
+      <div id="invites"></div>
+      <div class="status" id="invSt" role="status"></div>
+    </div>
+    <div class="box" style="margin-top:12px">
       <h4>أعضاء الفريق</h4>
-      <p class="note">كل من يسجّل في التطبيق يظهر هنا غير مفعّل. فعّله ليرى العملاء ويعدّل عليهم. المدير وحده يحذف ويفعّل.</p>
+      <p class="note">أوقف حساب أي موظف يغادر الشركة فوراً، فيفقد الوصول للبيانات مباشرة.</p>
       <div id="team"></div>
       <div class="status" id="teamSt" role="status"></div>
     </div>
+  </section>
+
+  <section id="p-audit" hidden>
+    <p class="note">كل إضافة أو تعديل أو حذف في النظام، ومن قام به ومتى. هذا السجل لا يمكن تعديله أو حذفه من التطبيق.</p>
+    <div class="tools" style="margin:10px 0">
+      <select id="auF" aria-label="نوع التغيير"><option value="">كل التغييرات</option><option value="DELETE">الحذف فقط</option><option value="UPDATE">التعديل فقط</option><option value="INSERT">الإضافة فقط</option></select>
+      <button class="btn ghost" id="auMore">تحميل المزيد</button>
+    </div>
+    <div class="tbl"><table>
+      <thead><tr><th>الوقت</th><th>بواسطة</th><th>العملية</th><th>القسم</th><th>السجل</th><th>التفاصيل</th></tr></thead>
+      <tbody id="audit"></tbody>
+    </table></div>
   </section>
 
   <p class="note" id="conn">جارٍ تحميل البيانات…</p>

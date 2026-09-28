@@ -22,10 +22,28 @@ const addDays = (s,n) => { const d = new Date(s+"T00:00:00"); d.setDate(d.getDat
 let T = todayISO();
 const redirectURL = () => location.origin + location.pathname;
 
-function show(view){ ["authView","pendingView","newPassView","appView"].forEach(v => $("#"+v).hidden = v !== view); }
+function show(view){ ["authView","pendingView","mfaView","newPassView","appView"].forEach(v => $("#"+v).hidden = v !== view); }
+
+// يمنع عرض التطبيق داخل موقع آخر (حماية من خداع النقرات)
+if (window.top !== window.self) { document.documentElement.innerHTML = ""; throw new Error("framed"); }
+
+/* ================= الخروج التلقائي ================= */
+const IDLE_MIN = 30, IDLE_KEY = "tcrm_last_active";
+const markActive = () => { try { localStorage.setItem(IDLE_KEY, String(Date.now())); } catch (_) {} };
+const lastActive = () => { try { return Number(localStorage.getItem(IDLE_KEY)) || 0; } catch (_) { return 0; } };
+const idleExpired = () => { const t = lastActive(); return t && Date.now() - t > IDLE_MIN * 60000; };
+let lastMark = 0;
+["click","keydown","touchstart","scroll"].forEach(ev => document.addEventListener(ev, () => {
+  if (Date.now() - lastMark > 15000) { lastMark = Date.now(); markActive(); }
+}, { passive: true }));
+setInterval(async () => {
+  if (booted && idleExpired()) { await sb.auth.signOut(); location.replace(redirectURL() + "#timeout"); }
+}, 60000);
 function setSt(el, msg, err){ el.className = "status" + (err ? " err" : ""); el.textContent = msg || ""; }
 function errMsg(e){
   const m = (e && (e.message || e.error_description)) || "";
+  if (/signup_not_invited|Database error saving new user/i.test(m)) return "هذا البريد غير مدعو. اطلب من مدير النظام إضافة بريدك أولاً، ثم سجّل بنفس البريد.";
+  if (/Invalid TOTP|invalid.*code|expired/i.test(m) && /totp|code|mfa|factor/i.test(m)) return "الرمز غير صحيح أو انتهت صلاحيته. اكتب الرمز الحالي من التطبيق.";
   if (/Invalid login credentials/i.test(m)) return "البريد أو كلمة المرور غير صحيحة.";
   if (/Email not confirmed/i.test(m)) return "أكّد بريدك أولاً من الرسالة التي وصلتك، ثم سجّل الدخول.";
   if (/already registered|already been registered/i.test(m)) return "هذا البريد مسجّل مسبقاً. سجّل الدخول أو استخدم (نسيت كلمة المرور).";
@@ -46,7 +64,7 @@ function setAuthMode(m){
   $("#fPass").hidden = m === "reset";
   $("#aPass").autocomplete = m === "signup" ? "new-password" : "current-password";
   $("#toSignup").hidden = m !== "login"; $("#toReset").hidden = m !== "login"; $("#toLogin").hidden = m === "login";
-  setSt($("#authSt"), "");
+  setSt($("#authSt"), m === "signup" ? "التسجيل بدعوة فقط: استخدم البريد الذي أضافه مدير النظام." : "");
 }
 $("#toSignup").onclick = () => setAuthMode("signup");
 $("#toReset").onclick = () => setAuthMode("reset");
@@ -86,6 +104,21 @@ $("#newPassForm").addEventListener("submit", async e => {
 });
 $("#logout").onclick = $("#pendingOut").onclick = async () => { await sb.auth.signOut(); location.replace(redirectURL()); };
 $("#pendingRetry").onclick = () => boot();
+$("#mfaOut").onclick = async () => { await sb.auth.signOut(); location.replace(redirectURL()); };
+$("#mfaForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const code = $("#mfaCode").value.replace(/\D/g, ""), st = $("#mfaSt"), btn = $("#mfaBtn");
+  if (code.length !== 6) return setSt(st, "الرمز 6 أرقام.", true);
+  btn.disabled = true; setSt(st, "جارٍ التحقق…");
+  try {
+    const { data, error } = await sb.auth.mfa.listFactors(); if (error) throw error;
+    const f = (data.totp || []).find(x => x.status === "verified"); if (!f) throw new Error("no factor");
+    const r = await sb.auth.mfa.challengeAndVerify({ factorId: f.id, code }); if (r.error) throw r.error;
+    $("#mfaCode").value = ""; setSt(st, ""); await boot();
+  } catch (err) { setSt(st, errMsg(err), true); }
+  finally { btn.disabled = false; }
+});
+if (location.hash === "#timeout") { setSt($("#authSt"), `خرجت تلقائياً بعد ${IDLE_MIN} دقيقة بدون استخدام. سجّل الدخول مرة أخرى.`); history.replaceState(null, "", redirectURL()); }
 
 let recovering = false;
 sb.auth.onAuthStateChange((ev, session) => {
@@ -98,13 +131,18 @@ async function boot(){
   const { data: { session } } = await sb.auth.getSession();
   if (!session) { show("authView"); setAuthMode(authMode); return; }
   if (recovering) return;
+  if (idleExpired()) { await sb.auth.signOut(); show("authView"); setAuthMode("login"); setSt($("#authSt"), `خرجت تلقائياً بعد ${IDLE_MIN} دقيقة بدون استخدام. سجّل الدخول مرة أخرى.`); return; }
+  markActive();
   me = session.user;
+  const { data: aal } = await sb.auth.mfa.getAuthenticatorAssuranceLevel();
+  if (aal && aal.nextLevel === "aal2" && aal.currentLevel !== "aal2") { show("mfaView"); setTimeout(() => $("#mfaCode").focus(), 50); return; }
   const { data: p, error } = await sb.from("profiles").select("*").eq("id", me.id).maybeSingle();
   if (error) { show("authView"); setSt($("#authSt"), errMsg(error), true); return; }
   profile = p;
   if (!p || !p.active) { $("#pendingEmail").textContent = me.email; show("pendingView"); return; }
   $("#me").textContent = (p.full_name || p.email) + (p.role === "admin" ? " · مدير" : "");
   $("#teamTab").hidden = p.role !== "admin";
+  $("#auditTab").hidden = p.role !== "admin";
   show("appView");
   if (!booted) { booted = true; setInterval(() => { if (!document.hidden) load(); }, 60000); }
   await load();
@@ -190,8 +228,9 @@ document.addEventListener("click", e => {
   const t = e.target.closest("nav button"); if (t) {
     tab = t.dataset.tab;
     document.querySelectorAll("nav button").forEach(b => b.setAttribute("aria-selected", b === t));
-    ["queue","deals","log","team"].forEach(n => $("#p-"+n).hidden = n !== tab);
+    ["queue","deals","log","team","audit"].forEach(n => $("#p-"+n).hidden = n !== tab);
     if (tab === "team") renderTeam();
+    if (tab === "audit") loadAudit(true);
     return;
   }
   const cp = e.target.closest("[data-copy]"); if (cp) {
@@ -356,8 +395,145 @@ $("#newDeal").onclick = () => {
   $("#ndName").focus();
 };
 
+/* ================= الدعوات (للمدير) ================= */
+async function renderInvites(){
+  const { data, error } = await sb.from("invites").select("*").order("created_at", { ascending: false });
+  if (error) { setSt($("#invSt"), errMsg(error), true); return; }
+  $("#invites").innerHTML = (data || []).map(i => `<div class="team-row">
+      <div><b>${esc(i.full_name || "—")}</b><div class="note" dir="ltr" style="text-align:right">${esc(i.email)}</div></div>
+      <span class="pill ${i.used_at ? "ok" : "soon"}">${i.used_at ? "سجّل" : "لم يسجّل بعد"}</span>
+      ${i.used_at ? "<span></span>" : `<button class="btn ghost" data-uninv="${esc(i.email)}">إلغاء الدعوة</button>`}
+    </div>`).join("") || '<p class="note">لا توجد دعوات بعد.</p>';
+  $("#invites").querySelectorAll("[data-uninv]").forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    const { error } = await sb.from("invites").delete().eq("email", b.dataset.uninv);
+    if (error) setSt($("#invSt"), errMsg(error), true); else setSt($("#invSt"), "أُلغيت الدعوة.");
+    renderInvites();
+  });
+}
+$("#invAdd").onclick = async () => {
+  const email = $("#invEmail").value.trim().toLowerCase(), full_name = $("#invName").value.trim(), st = $("#invSt");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return setSt(st, "اكتب بريداً إلكترونياً صحيحاً.", true);
+  if (Object.values(people).some(p => p.email === email)) return setSt(st, "هذا البريد مسجّل في الفريق مسبقاً.", true);
+  $("#invAdd").disabled = true;
+  const { error } = await sb.from("invites").insert({ email, full_name });
+  $("#invAdd").disabled = false;
+  if (error) return setSt(st, /duplicate|unique/i.test(error.message) ? "هذا البريد مدعو مسبقاً." : errMsg(error), true);
+  $("#invEmail").value = ""; $("#invName").value = "";
+  setSt(st, `تمت الدعوة. أرسل للموظف الرابط ${redirectURL()} ليسجّل بالبريد ${email}.`);
+  renderInvites();
+};
+
+/* ================= سجل المراقبة (للمدير) ================= */
+const TBL_AR = { deals: "العملاء", contacts: "جهات التواصل", activity: "النشاط", profiles: "الفريق", invites: "الدعوات", settings: "الإعدادات" };
+const OP_AR = { INSERT: "إضافة", UPDATE: "تعديل", DELETE: "حذف" };
+const FIELD_AR = { name: "الاسم", location: "الموقع", units: "الوحدات", contract: "العقد", source: "المصدر", stage: "المرحلة", priority: "الأولوية",
+  last_action: "آخر إجراء", next_step: "الخطوة التالية", next_date: "موعدها", notes: "ملاحظات", phone: "الجوال", role: "الصفة/الصلاحية",
+  active: "مفعّل", full_name: "الاسم", summary: "الملخص", type: "النوع", date: "التاريخ", last_activity: "آخر نشاط", date_basis: "أساس الموعد", email: "البريد", sort_order: "الترتيب" };
+const SKIP = new Set(["updated_at","updated_by","created_at","created_by","id","deal_id"]);
+let auditRows = [], auditPage = 0;
+const fmtTs = s => { try { return new Intl.DateTimeFormat("ar-SA-u-ca-gregory-nu-latn", { dateStyle: "short", timeStyle: "short", timeZone: "Asia/Riyadh" }).format(new Date(s)); } catch (_) { return s; } };
+const short = v => { const s = v === null || v === undefined || v === "" ? "—" : typeof v === "object" ? JSON.stringify(v) : String(v); return s.length > 60 ? s.slice(0,60) + "…" : s; };
+function auditLabel(r){
+  const d = r.new_data || r.old_data || {};
+  if (r.table_name === "deals") return d.name;
+  if (r.table_name === "contacts") return [d.name, d.phone].filter(Boolean).join(" · ");
+  if (r.table_name === "activity") return (deals.find(x => x.id === d.deal_id)?.name || "") + (d.summary ? " — " + short(d.summary) : "");
+  return d.full_name || d.email || d.key || r.row_id;
+}
+function auditDetail(r){
+  if (r.op === "UPDATE") {
+    const o = r.old_data || {}, n = r.new_data || {};
+    return Object.keys(n).filter(k => !SKIP.has(k) && JSON.stringify(o[k]) !== JSON.stringify(n[k]))
+      .map(k => `${FIELD_AR[k] || k}: ${esc(short(o[k]))} ← ${esc(short(n[k]))}`).join("<br>") || "—";
+  }
+  const d = r.new_data || r.old_data || {};
+  return Object.keys(d).filter(k => !SKIP.has(k) && d[k] !== "" && d[k] !== null).slice(0,4).map(k => `${FIELD_AR[k] || k}: ${esc(short(d[k]))}`).join("<br>");
+}
+async function loadAudit(reset){
+  if (reset) { auditRows = []; auditPage = 0; }
+  const f = $("#auF").value, size = 100;
+  let q = sb.from("audit_log").select("*").order("at", { ascending: false }).range(auditPage*size, auditPage*size + size - 1);
+  if (f) q = q.eq("op", f);
+  const { data, error } = await q;
+  if (error) { $("#audit").innerHTML = `<tr><td colspan="6" class="empty">${esc(errMsg(error))}</td></tr>`; return; }
+  auditRows = auditRows.concat(data || []); auditPage++;
+  $("#auMore").hidden = (data || []).length < size;
+  $("#audit").innerHTML = auditRows.map(r => `<tr>
+      <td class="d">${esc(fmtTs(r.at))}</td><td>${esc(r.actor ? (who(r.actor) || r.actor_email || "") : "النظام")}</td>
+      <td><span class="pill ${r.op === "DELETE" ? "due" : r.op === "INSERT" ? "ok" : ""}">${OP_AR[r.op] || r.op}</span></td>
+      <td>${esc(TBL_AR[r.table_name] || r.table_name)}</td><td>${esc(auditLabel(r) || "")}</td><td style="font-size:13px">${auditDetail(r)}</td></tr>`).join("")
+    || `<tr><td colspan="6" class="empty">لا توجد تغييرات مسجّلة بعد.</td></tr>`;
+}
+$("#auF").addEventListener("input", () => loadAudit(true));
+$("#auMore").onclick = () => loadAudit(false);
+
+/* ================= حسابي والأمان ================= */
+async function accountDrawer(){
+  const el = $("#drawer"); openId = null;
+  const { data: fl } = await sb.auth.mfa.listFactors();
+  const factor = (fl?.totp || []).find(x => x.status === "verified");
+  el.innerHTML = `
+    <button class="x" id="dx">إغلاق</button>
+    <div><div class="eyebrow">حسابي والأمان</div><h3>${esc(profile.full_name || profile.email)}</h3><div class="note" dir="ltr" style="text-align:right">${esc(profile.email)}</div></div>
+    <div class="box"><h4>التحقق بخطوتين</h4>
+      ${factor
+        ? `<p class="note">مفعّل ✓. عند كل تسجيل دخول يُطلب منك رمز من تطبيق المصادقة على جوالك.</p><button class="btn danger" id="mfaOff">إيقاف التحقق بخطوتين</button>`
+        : `<p class="note">أضف طبقة حماية: حتى لو عرف أحد كلمة مرورك، لا يدخل بدون الرمز من جوالك. تحتاج تطبيق مصادقة مثل Google Authenticator أو Microsoft Authenticator.</p><button class="btn" id="mfaOn">تفعيل التحقق بخطوتين</button>`}
+      <div id="mfaSetup"></div>
+      <div class="status" id="accSt" role="status"></div>
+    </div>
+    <div class="box"><h4>تغيير كلمة المرور</h4>
+      <div class="field"><label for="accPass">كلمة المرور الجديدة (8 أحرف على الأقل)</label><input id="accPass" type="password" dir="ltr" autocomplete="new-password"></div>
+      <button class="btn" id="accPassBtn">حفظ كلمة المرور</button>
+      <div class="status" id="accPassSt" role="status"></div>
+    </div>
+    <div class="box"><h4>الجلسة</h4><p class="note">تخرج تلقائياً بعد ${IDLE_MIN} دقيقة بدون استخدام، لحماية بياناتك إذا نسيت الجهاز مفتوحاً.</p></div>`;
+  el.hidden = false; $("#scrim").hidden = false;
+  $("#dx").onclick = closeDrawer;
+  $("#accPassBtn").onclick = async () => {
+    const p = $("#accPass").value, st = $("#accPassSt");
+    if (p.length < 8) return setSt(st, "8 أحرف على الأقل.", true);
+    const { error } = await sb.auth.updateUser({ password: p });
+    if (error) return setSt(st, errMsg(error), true);
+    $("#accPass").value = ""; setSt(st, "تم تغيير كلمة المرور.");
+  };
+  if ($("#mfaOff")) $("#mfaOff").onclick = async () => {
+    const { error } = await sb.auth.mfa.unenroll({ factorId: factor.id });
+    if (error) return setSt($("#accSt"), errMsg(error), true);
+    await sb.auth.refreshSession(); accountDrawer();
+  };
+  if ($("#mfaOn")) $("#mfaOn").onclick = async () => {
+    const st = $("#accSt");
+    // إزالة أي محاولة تفعيل سابقة لم تكتمل
+    for (const f of (fl?.all || []).filter(x => x.status !== "verified")) await sb.auth.mfa.unenroll({ factorId: f.id });
+    const { data, error } = await sb.auth.mfa.enroll({ factorType: "totp", friendlyName: "عملاء توتال " + Date.now() });
+    if (error) return setSt(st, errMsg(error), true);
+    $("#mfaOn").hidden = true;
+    $("#mfaSetup").innerHTML = `
+      <ol class="note" style="margin:0;padding-inline-start:18px">
+        <li>افتح تطبيق المصادقة على جوالك واضغط «إضافة».</li>
+        <li>امسح هذا الرمز، أو انسخ المفتاح وألصقه يدوياً.</li>
+        <li>اكتب الرمز المكوّن من 6 أرقام الذي يظهر في التطبيق.</li>
+      </ol>
+      <img src="${esc(data.totp.qr_code)}" alt="رمز QR للتحقق بخطوتين" style="width:190px;height:190px;background:#fff;border-radius:8px;padding:6px;align-self:center">
+      <div class="contact"><span class="note">المفتاح:</span><span><span class="phone" style="font-size:13px">${esc(data.totp.secret)}</span> <button class="btn ghost" data-copy="${esc(data.totp.secret)}">نسخ</button></span></div>
+      <div class="field"><label for="enrCode">الرمز من التطبيق</label><input id="enrCode" inputmode="numeric" maxlength="6" dir="ltr" autocomplete="one-time-code"></div>
+      <button class="btn" id="enrOk">تأكيد التفعيل</button>`;
+    $("#enrOk").onclick = async () => {
+      const code = $("#enrCode").value.replace(/\D/g, "");
+      if (code.length !== 6) return setSt(st, "الرمز 6 أرقام.", true);
+      const r = await sb.auth.mfa.challengeAndVerify({ factorId: data.id, code });
+      if (r.error) return setSt(st, errMsg(r.error), true);
+      accountDrawer(); setTimeout(() => setSt($("#accSt"), "تم تفعيل التحقق بخطوتين."), 50);
+    };
+  };
+}
+$("#account").onclick = () => accountDrawer();
+
 /* ================= الفريق (للمدير) ================= */
 function renderTeam(){
+  renderInvites();
   const list = Object.values(people);
   $("#team").innerHTML = list.map(p => `<div class="team-row">
       <div><b>${esc(p.full_name || "—")}</b><div class="note" dir="ltr" style="text-align:right">${esc(p.email)}</div></div>
