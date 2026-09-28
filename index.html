@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>عملاء توتال</title>
+<meta name="description" content="نظام متابعة عملاء توتال لإدارة المرافق">
+<meta name="author" content="رامي هادي رياني">
+<meta name="theme-color" content="#172A7E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="عملاء توتال">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ======== شاشة الدخول ======== -->
+<section class="auth" id="authView" hidden>
+  <form class="auth-card" id="authForm" novalidate>
+    <img class="logo" src="icons/logo.png" alt="توتال لإدارة المرافق">
+    <h2 id="authTitle">تسجيل الدخول</h2>
+    <div class="field" id="fName" hidden><label for="aName">الاسم الكامل</label><input id="aName" autocomplete="name"></div>
+    <div class="field"><label for="aEmail">البريد الإلكتروني</label><input id="aEmail" type="email" autocomplete="email" dir="ltr" required></div>
+    <div class="field" id="fPass"><label for="aPass">كلمة المرور</label><input id="aPass" type="password" autocomplete="current-password" dir="ltr" minlength="8" required></div>
+    <button class="btn" type="submit" id="authBtn">دخول</button>
+    <div class="status" id="authSt" role="status"></div>
+    <div class="switch">
+      <button type="button" class="linkbtn" id="toSignup">حساب جديد</button>
+      <button type="button" class="linkbtn" id="toReset">نسيت كلمة المرور</button>
+      <button type="button" class="linkbtn" id="toLogin" hidden>العودة لتسجيل الدخول</button>
+    </div>
+  </form>
+</section>
+
+<!-- ======== بانتظار التفعيل / كلمة مرور جديدة ======== -->
+<section class="auth" id="pendingView" hidden>
+  <div class="auth-card">
+    <img class="logo" src="icons/logo.png" alt="توتال لإدارة المرافق">
+    <h2>حسابك بانتظار التفعيل</h2>
+    <p class="note" style="text-align:center">سجّلت بالبريد <b id="pendingEmail" dir="ltr"></b>. سيفعّل المدير حسابك، ثم تفتح التطبيق وتبدأ.</p>
+    <button class="btn" id="pendingRetry">تحقّق مرة أخرى</button>
+    <button class="btn ghost" id="pendingOut">تسجيل الخروج</button>
+  </div>
+</section>
+<section class="auth" id="newPassView" hidden>
+  <form class="auth-card" id="newPassForm">
+    <img class="logo" src="icons/logo.png" alt="توتال لإدارة المرافق">
+    <h2>كلمة مرور جديدة</h2>
+    <div class="field"><label for="np">كلمة المرور الجديدة (8 أحرف على الأقل)</label><input id="np" type="password" dir="ltr" minlength="8" autocomplete="new-password" required></div>
+    <button class="btn" type="submit">حفظ</button>
+    <div class="status" id="npSt" role="status"></div>
+  </form>
+</section>
+
+<!-- ======== التطبيق ======== -->
+<div class="wrap" id="appView" hidden>
+  <header>
+    <div class="brandline">
+      <img src="icons/logo.png" alt="توتال">
+      <div>
+        <div class="eyebrow">إدارة علاقات العملاء</div>
+        <h1>عملاء توتال</h1>
+        <div class="org">توتال لإدارة المرافق · سكني - مكتبي - تجاري</div>
+      </div>
+    </div>
+    <div class="hdr-side">
+      <div class="org" id="today"></div>
+      <div class="who"><span id="me"></span><button class="btn ghost" id="logout">خروج</button></div>
+      <div class="tools">
+        <select id="rpScope" aria-label="نطاق التقرير"><option value="all">تقرير كامل</option><option value="open">العملاء المفتوحون</option><option value="queue">المتابعات المستحقة</option></select>
+        <button class="btn" id="rpBtn">تقرير PDF</button>
+      </div>
+      <div class="status" id="rpSt" role="status"></div>
+    </div>
+  </header>
+  <div class="bar" aria-hidden="true"><i></i><i></i><i></i></div>
+
+  <div class="install" id="installBox" hidden>
+    <span>ثبّت "عملاء توتال" على جهازك ليفتح كتطبيق.</span>
+    <button class="btn" id="installBtn">تثبيت</button>
+  </div>
+
+  <section class="stats" id="stats" aria-label="ملخص"></section>
+
+  <nav role="tablist">
+    <button role="tab" aria-selected="true" data-tab="queue">قائمة المتابعة</button>
+    <button role="tab" aria-selected="false" data-tab="deals">كل العملاء</button>
+    <button role="tab" aria-selected="false" data-tab="log">سجل النشاط</button>
+    <button role="tab" aria-selected="false" data-tab="team" id="teamTab" hidden>الفريق</button>
+  </nav>
+
+  <section id="p-queue">
+    <p class="note">كل عميل مفتوح بلا خطوة تالية، أو موعد خطوته اليوم أو قبله، أو خلال 7 أيام. اضغط على العميل لتسجيل ما حدث وتحديد الخطوة التالية.</p>
+    <div id="queue" class="list" style="margin-top:10px"></div>
+  </section>
+
+  <section id="p-deals" hidden>
+    <div class="tools">
+      <input type="search" id="q" placeholder="ابحث بالاسم أو الحي أو الجوال">
+      <select id="fStage" aria-label="تصفية حسب المرحلة"><option value="">كل المراحل</option></select>
+      <select id="fSrc" aria-label="تصفية حسب المصدر"><option value="">كل المصادر</option><option>من خلال الموظف</option><option>من خلال الشركة</option></select>
+      <button class="btn" id="newDeal">عميل جديد</button>
+    </div>
+    <div id="deals" class="list" style="margin-top:10px"></div>
+  </section>
+
+  <section id="p-log" hidden>
+    <div class="tbl"><table>
+      <thead><tr><th>التاريخ</th><th>النوع</th><th>العميل</th><th>جهة التواصل</th><th>الملخص</th><th>بواسطة</th></tr></thead>
+      <tbody id="log"></tbody>
+    </table></div>
+  </section>
+
+  <section id="p-team" hidden>
+    <div class="box">
+      <h4>أعضاء الفريق</h4>
+      <p class="note">كل من يسجّل في التطبيق يظهر هنا غير مفعّل. فعّله ليرى العملاء ويعدّل عليهم. المدير وحده يحذف ويفعّل.</p>
+      <div id="team"></div>
+      <div class="status" id="teamSt" role="status"></div>
+    </div>
+  </section>
+
+  <p class="note" id="conn">جارٍ تحميل البيانات…</p>
+  <footer class="credit">© 2026 نظام متابعة عملاء توتال · إعداد وتصميم: رامي هادي رياني · جميع الحقوق محفوظة</footer>
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="تفاصيل العميل"></aside>
+<div id="rpStage" aria-hidden="true"></div>
+
+<script src="vendor/supabase.js"></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
