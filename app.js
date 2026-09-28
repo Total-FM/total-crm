@@ -12,7 +12,15 @@ const TYPES = ["اتصال","واتساب","اجتماع","معاينة","عرض
 const SOURCES = ["من خلال الشركة","من خلال الموظف"];
 const PR = {"عالية":0,"متوسطة":1,"منخفضة":2,"":3};
 
-let me = null, profile = null, deals = [], acts = [], people = {}, grants = [], tab = "queue", openId = null, confirmDel = false, booted = false;
+const LOST = new Set(["معتذر","متوقف"]);
+const LOST_REASONS = ["السعر مرتفع","تعاقد مع شركة أخرى","يفضّل الإدارة الفردية","لا يرغب في التغيير حالياً","عقد حالي طويل","لا يوجد رد","قرار الملاك/الجمعية","أخرى"];
+const Q_STATUS = ["مسودة","مُرسل","قيد التفاوض","مقبول","مرفوض"];
+const Q_OPEN = new Set(["مُرسل","قيد التفاوض"]);
+const FILE_KINDS = ["عرض سعر","عقد","صورة الموقع","أخرى"];
+const CITY = { "الرياض": "RUH", "جدة": "JED", "الدمام": "DMM", "الخبر": "KHB", "الظهران": "DHA", "مكة": "MKK", "المدينة": "MED", "الجبيل": "JUB", "القطيف": "QTF", "الأحساء": "HSA" };
+
+let me = null, profile = null, deals = [], acts = [], people = {}, grants = [], quotes = [], insps = [], files = [],
+    tab = "queue", openId = null, dtab = "main", confirmDel = false, booted = false, dupOk = false;
 const isAdmin = () => !!profile && profile.role === "admin";
 // مستوى صلاحيتي على عميل: 2 تعديل، 1 قراءة فقط. قاعدة البيانات تفرض نفس القاعدة، وهذا لعرض الشاشة فقط.
 function levelOf(d){
@@ -28,6 +36,25 @@ const todayISO = () => iso(new Date());
 const addDays = (s,n) => { const d = new Date(s+"T00:00:00"); d.setDate(d.getDate()+n); return iso(d); };
 let T = todayISO();
 const redirectURL = () => location.origin + location.pathname;
+const daysTo = s => Math.round((new Date(s + "T00:00:00") - new Date(T + "T00:00:00")) / 86400000);
+const money = v => v === null || v === undefined || v === "" ? "—" : new Intl.NumberFormat("ar-SA-u-nu-latn", { maximumFractionDigits: 0 }).format(Number(v)) + " ر.س";
+const kb = n => !n ? "" : n < 1048576 ? Math.max(1, Math.round(n / 1024)) + " ك.ب" : (n / 1048576).toFixed(1) + " م.ب";
+// رقم سعودي بصيغة دولية للاتصال والواتساب: 05xxxxxxxx أو 5xxxxxxxx أو 00966… ← 9665xxxxxxxx
+function intlNum(p){
+  let d = String(p || "").replace(/\D/g, "");
+  if (d.startsWith("00")) d = d.slice(2);
+  if (d.startsWith("0")) d = "966" + d.slice(1);
+  else if (d.length === 9 && d.startsWith("5")) d = "966" + d;
+  return d.length >= 11 && d.length <= 15 ? d : "";
+}
+// تنبيه تجديد العقد: 90 / 60 / 30 يوماً قبل الانتهاء، ويبقى 30 يوماً بعده
+function renewal(d){
+  if (!d.contractEnd) return null;
+  const n = daysTo(d.contractEnd);
+  if (n < -30 || n > 90) return null;
+  return { n, k: n <= 30 ? "due" : n <= 60 ? "soon" : "ok",
+    t: n < 0 ? `انتهى العقد منذ ${-n} يوم` : n === 0 ? "العقد ينتهي اليوم" : `العقد ينتهي بعد ${n} يوم` };
+}
 
 function show(view){ ["authView","pendingView","mfaView","newPassView","appView"].forEach(v => $("#"+v).hidden = v !== view); }
 
@@ -57,7 +84,9 @@ function errMsg(e){
   if (/rate limit|too many/i.test(m)) return "محاولات كثيرة. انتظر قليلاً ثم حاول مرة أخرى.";
   if (/Password should be/i.test(m)) return "كلمة المرور قصيرة. استخدم 8 أحرف على الأقل.";
   if (/network|fetch/i.test(m)) return "تعذّر الاتصال بالخادم. تحقّق من الإنترنت.";
-  if (/row-level security|permission/i.test(m)) return "ليست لديك صلاحية لهذا الإجراء.";
+  if (/row-level security|permission|Unauthorized/i.test(m)) return "ليست لديك صلاحية لهذا الإجراء.";
+  if (/file_too_big|exceeded the maximum|Payload too large/i.test(m)) return "الملف أكبر من 15 ميغابايت. صغّر حجمه ثم أعد المحاولة.";
+  if (/mime type|not supported|invalid_mime/i.test(m)) return "نوع الملف غير مسموح. المسموح: PDF والصور وملفات Word وExcel.";
   return "حدث خطأ: " + m;
 }
 
@@ -149,6 +178,7 @@ async function boot(){
   if (!p || !p.active) { $("#pendingEmail").textContent = me.email; show("pendingView"); return; }
   $("#me").textContent = (p.full_name || p.email) + (p.role === "admin" ? " · مدير" : "");
   $("#teamTab").hidden = p.role !== "admin";
+  $("#dashTab").hidden = p.role !== "admin";
   $("#auditTab").hidden = p.role !== "admin";
   show("appView");
   if (!booted) { booted = true; setInterval(() => { if (!document.hidden) load(); }, 60000); }
@@ -161,16 +191,23 @@ function mapDeal(r){
   return { id: r.id, order: r.sort_order, name: r.name, location: r.location, units: r.units, contract: r.contract, source: r.source,
     stage: r.stage, priority: r.priority || "", lastAction: r.last_action, nextStep: r.next_step, nextDate: r.next_date || "",
     dateBasis: r.date_basis, lastActivity: r.last_activity || "", notes: r.notes, updatedAt: r.updated_at, updatedBy: r.updated_by, ownerId: r.owner_id,
+    contractEnd: r.contract_end || "", lostReason: r.lost_reason || "",
     contacts: (r.contacts || []).sort((a,b) => a.sort_order - b.sort_order) };
 }
 async function load(){
   try {
-    const [d, a, p, g] = await Promise.all([
+    const [d, a, p, g, qo, ins, fi] = await Promise.all([
       sb.from("deals").select("*, contacts(*)").order("sort_order"),
       sb.from("activity").select("*").order("date", { ascending: false }).order("created_at", { ascending: false }).limit(1000),
       sb.from("profiles").select("id, email, full_name, role, active, created_at").order("created_at"),
-      sb.from("access_grants").select("*").order("created_at")
+      sb.from("access_grants").select("*").order("created_at"),
+      sb.from("quotes").select("*").order("quote_date", { ascending: false }).order("created_at", { ascending: false }),
+      sb.from("inspections").select("*").order("visit_date", { ascending: false }).order("created_at", { ascending: false }),
+      sb.from("attachments").select("*").order("created_at", { ascending: false })
     ]);
+    quotes = qo.error ? [] : (qo.data || []);
+    insps = ins.error ? [] : (ins.data || []);
+    files = fi.error ? [] : (fi.data || []);
     if (d.error) throw d.error; if (a.error) throw a.error;
     grants = g.error ? [] : (g.data || []);
     deals = d.data.map(mapDeal);
@@ -180,6 +217,7 @@ async function load(){
     $("#conn").textContent = "";
     render();
     if (tab === "team") renderTeam();
+    if (tab === "dash") renderDash();
   } catch (e) { $("#conn").textContent = "تعذّر تحميل البيانات. " + errMsg(e); }
 }
 const who = id => { const p = people[id]; return p ? (p.full_name || p.email) : ""; };
@@ -198,11 +236,11 @@ function due(d){
 }
 const stagePill = s => `<span class="pill ${CLOSED.has(s) ? "stop" : ""}">${esc(s)}</span>`;
 function rowHTML(d){
-  const u = due(d), c = d.contacts[0];
+  const u = due(d), c = d.contacts[0], rn = renewal(d);
   return `<button class="row" data-id="${esc(d.id)}">
     <div><div class="nm">${esc(d.name)}</div><div class="sub">${esc([d.location, d.units && ("الوحدات: " + d.units)].filter(Boolean).join(" · ") || (c ? c.phone : ""))}</div></div>
     <div><div class="nx">${d.nextStep ? esc(d.nextStep) : '<span class="sub">لا توجد خطوة تالية</span>'}</div><div class="sub">${esc(d.lastAction || "")}</div></div>
-    <div class="meta">${d.ownerId !== me.id ? `<span class="pill own">${esc(who(d.ownerId) || "—")}</span>` : ""}${levelOf(d) < 2 ? '<span class="pill stop">قراءة فقط</span>' : ""}${d.priority ? `<span class="pill ${d.priority === "عالية" ? "hi" : ""}">${esc(d.priority)}</span>` : ""}${stagePill(d.stage)}${u ? `<span class="pill ${u.k}">${esc(u.t)}</span>` : ""}</div>
+    <div class="meta">${d.ownerId !== me.id ? `<span class="pill own">${esc(who(d.ownerId) || "—")}</span>` : ""}${levelOf(d) < 2 ? '<span class="pill stop">قراءة فقط</span>' : ""}${d.priority ? `<span class="pill ${d.priority === "عالية" ? "hi" : ""}">${esc(d.priority)}</span>` : ""}${stagePill(d.stage)}${u ? `<span class="pill ${u.k}">${esc(u.t)}</span>` : ""}${rn ? `<span class="pill ${rn.k}">${esc(rn.t)}</span>` : ""}</div>
   </button>`;
 }
 const sortQ = (a,b) => (PR[a.priority||""] - PR[b.priority||""]) || ((a.nextDate||"0") < (b.nextDate||"0") ? -1 : (a.nextDate||"0") > (b.nextDate||"0") ? 1 : 0) || a.order - b.order;
@@ -210,17 +248,25 @@ const sortQ = (a,b) => (PR[a.priority||""] - PR[b.priority||""]) || ((a.nextDate
 function queueParts(){
   const open = deals.filter(d => !CLOSED.has(d.stage));
   const q = open.filter(d => { const u = due(d); return u && (u.k === "due" || u.k === "soon"); });
-  return { open, q, dueNow: q.filter(d => due(d).k === "due" && d.nextDate && d.nextStep), noDate: q.filter(d => !d.nextDate || !d.nextStep), soon: q.filter(d => due(d).k === "soon") };
+  const renew = deals.filter(renewal).sort((a,b) => a.contractEnd < b.contractEnd ? -1 : 1);
+  return { open, q, renew, dueNow: q.filter(d => due(d).k === "due" && d.nextDate && d.nextStep), noDate: q.filter(d => !d.nextDate || !d.nextStep), soon: q.filter(d => due(d).k === "soon") };
+}
+function filteredDeals(){
+  const s = $("#q").value.trim(), fs = $("#fStage").value, fr = $("#fSrc").value, fw = $("#fOwner").value;
+  return deals.filter(d => (!fs || d.stage === fs) && (!fr || d.source === fr) && (!fw || d.ownerId === fw) &&
+    (!s || [d.name, d.location, d.notes, ...d.contacts.flatMap(c => [c.name, c.phone])].join(" ").includes(s)));
 }
 function render(){
-  const { open, dueNow, noDate, soon } = queueParts();
+  const { open, dueNow, noDate, soon, renew } = queueParts();
   const cnt = s => deals.filter(d => d.stage === s).length;
   $("#stats").innerHTML = [
     ["hot", dueNow.length, "مستحقة اليوم أو متأخرة"], ["", soon.length, "خلال 7 أيام"], ["", noDate.length, "بلا موعد متابعة"],
+    ["hot", renew.length, "عقود تنتهي خلال 90 يوماً"],
     ["", open.length, "عملاء مفتوحون"], ["", cnt("تم تقديم عرض"), "تم تقديم عرض"], ["", cnt("تم التعاقد"), "تم التعاقد"]
   ].map(([c,n,l]) => `<div class="stat ${c && n ? c : ""}"><b>${n}</b><span>${l}</span></div>`).join("");
   const grp = (t, l) => l.length ? `<div class="group"><h2>${t} · ${l.length}</h2>${l.slice().sort(sortQ).map(rowHTML).join("")}</div>` : "";
-  $("#queue").innerHTML = (grp("مستحقة الآن", dueNow) + grp("هذا الأسبوع", soon) + grp("بلا موعد متابعة", noDate)) || `<div class="empty">لا توجد متابعات مستحقة.</div>`;
+  const grpR = l => l.length ? `<div class="group"><h2>عقود تنتهي قريباً · ${l.length}</h2>${l.map(rowHTML).join("")}</div>` : "";
+  $("#queue").innerHTML = (grp("مستحقة الآن", dueNow) + grpR(renew) + grp("هذا الأسبوع", soon) + grp("بلا موعد متابعة", noDate)) || `<div class="empty">لا توجد متابعات مستحقة.</div>`;
 
   // فلتر المسؤول يظهر فقط إذا كان المستخدم يرى عملاء أكثر من موظف
   const owners = [...new Set(deals.map(d => d.ownerId))];
@@ -229,9 +275,7 @@ function render(){
   const keep = fo.value;
   fo.innerHTML = `<option value="">كل المسؤولين</option>` + owners.map(o => `<option value="${esc(o)}">${esc(o === me.id ? "عملائي" : (who(o) || "—"))}</option>`).join("");
   fo.value = owners.includes(keep) ? keep : "";
-  const s = $("#q").value.trim(), fs = $("#fStage").value, fr = $("#fSrc").value, fw = fo.value;
-  const list = deals.filter(d => (!fs || d.stage === fs) && (!fr || d.source === fr) && (!fw || d.ownerId === fw) &&
-    (!s || [d.name, d.location, d.notes, ...d.contacts.flatMap(c => [c.name, c.phone])].join(" ").includes(s)));
+  const list = filteredDeals();
   $("#deals").innerHTML = list.map(rowHTML).join("") || `<div class="empty">لا يوجد عميل مطابق.</div>`;
 
   $("#log").innerHTML = acts.map(a => `<tr><td class="d">${esc(a.date)}</td><td>${esc(a.type)}</td><td>${esc(a.dealName)}</td><td>${esc(a.contact)}</td><td>${esc(a.summary)}</td><td>${esc(who(a.createdBy))}</td></tr>`).join("")
@@ -240,12 +284,13 @@ function render(){
 }
 
 document.addEventListener("click", e => {
-  const r = e.target.closest(".row"); if (r) { confirmDel = false; drawer(r.dataset.id); return; }
+  const r = e.target.closest(".row"); if (r) { confirmDel = false; dupOk = false; dtab = "main"; drawer(r.dataset.id); return; }
   const t = e.target.closest("nav button"); if (t) {
     tab = t.dataset.tab;
     document.querySelectorAll("nav button").forEach(b => b.setAttribute("aria-selected", b === t));
-    ["queue","deals","log","team","audit"].forEach(n => $("#p-"+n).hidden = n !== tab);
+    ["queue","deals","log","dash","team","audit"].forEach(n => $("#p-"+n).hidden = n !== tab);
     if (tab === "team") renderTeam();
+    if (tab === "dash") renderDash();
     if (tab === "audit") loadAudit(true);
     return;
   }
@@ -260,18 +305,50 @@ document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(
 function closeDrawer(){ openId = null; $("#drawer").hidden = true; $("#scrim").hidden = true; }
 
 /* ================= تفاصيل العميل ================= */
+const INSP = [
+  ["buildings","عدد المباني / العمائر","num"], ["floors","عدد الأدوار","num"], ["elevators","عدد المصاعد","num"],
+  ["elevatorContract","عقد صيانة للمصاعد","yn"], ["gates","عدد البوابات","num"], ["gateAuto","بوابات آلية","yn"],
+  ["parking","عدد المواقف","num"], ["parkingType","نوع المواقف","مكشوفة|مظللة|قبو|مختلطة"],
+  ["gardens","حدائق ومسطحات خضراء","yn"], ["pool","مسبح","yn"], ["gym","نادي رياضي","yn"],
+  ["security","حراسة أمنية","yn"], ["cctv","كاميرات مراقبة","yn"], ["fire","نظام إنذار وإطفاء الحريق","yn"],
+  ["tanks","خزانات المياه","أرضي|علوي|أرضي وعلوي"], ["generator","مولد كهربائي","yn"], ["waste","حاويات النفايات","yn"],
+  ["cleaning","مستوى النظافة الحالي","ممتاز|جيد|مقبول|ضعيف"], ["maintenance","حالة الصيانة العامة","ممتازة|جيدة|مقبولة|ضعيفة"]
+];
+const INSP_L = Object.fromEntries(INSP.map(([k,l]) => [k,l]));
+const inspChips = data => Object.entries(data || {}).filter(([,v]) => v !== "" && v !== null).map(([k,v]) => `<span class="chip">${esc(INSP_L[k] || k)}: <b>${esc(v)}</b></span>`).join("");
+
 function drawer(id, refresh){
   const d = deals.find(x => x.id === id); if (!d) { closeDrawer(); return; }
   const el = $("#drawer");
   if (refresh && el.contains(document.activeElement) && document.activeElement.matches("input,textarea,select")) return;
+  if (refresh && [...el.querySelectorAll("input[type=file]")].some(f => f.files && f.files.length)) return;
   openId = id;
-  const hist = acts.filter(a => a.dealId === id);
   const admin = isAdmin(), canEdit = levelOf(d) >= 2;
-  const members = Object.values(people).filter(p => p.active);
+  const dq = quotes.filter(q => q.deal_id === id), di = insps.filter(x => x.deal_id === id), df = files.filter(f => f.deal_id === id);
+  const TABS = [["main","المتابعة"],["quotes","عروض الأسعار" + (dq.length ? " · " + dq.length : "")],["insp","المعاينة" + (di.length ? " · " + di.length : "")],["files","المرفقات" + (df.length ? " · " + df.length : "")]];
+  const body = dtab === "quotes" ? quotesHTML(d, dq, canEdit, admin) : dtab === "insp" ? inspHTML(d, di, canEdit, admin)
+             : dtab === "files" ? filesHTML(d, df, canEdit, admin) : mainHTML(d, canEdit, admin);
   el.innerHTML = `
     <button class="x" id="dx">إغلاق</button>
     <div><div class="eyebrow">${esc(d.source || "")}</div><h3>${esc(d.name)}</h3></div>
-    ${canEdit ? "" : '<p class="note" style="background:var(--card);padding:8px 12px;border-radius:8px">لديك صلاحية <b>قراءة فقط</b> على هذا العميل. للتعديل اطلب الصلاحية من المدير.</p>'}
+    ${canEdit ? "" : '<p class="note ro">لديك صلاحية <b>قراءة فقط</b> على هذا العميل. للتعديل اطلب الصلاحية من المدير.</p>'}
+    <div class="dtabs" role="tablist" aria-label="أقسام العميل">${TABS.map(([k,l]) => `<button role="tab" aria-selected="${dtab === k}" data-dtab="${k}">${l}</button>`).join("")}</div>
+    ${body}`;
+  el.hidden = false; $("#scrim").hidden = false;
+  $("#dx").onclick = closeDrawer;
+  el.querySelectorAll("[data-dtab]").forEach(b => b.onclick = () => { dtab = b.dataset.dtab; confirmDel = false; dupOk = false; drawer(id); });
+  if (dtab === "quotes") wireQuotes(d); else if (dtab === "insp") wireInsp(d); else if (dtab === "files") wireFiles(d); else wireMain(d);
+  fillLinks(el);
+}
+
+/* ---- تبويب المتابعة ---- */
+function mainHTML(d, canEdit, admin){
+  const hist = acts.filter(a => a.dealId === d.id), rn = renewal(d);
+  const members = Object.values(people).filter(p => p.active);
+  const [lr0, ...lrRest] = (d.lostReason || "").split(" — ");
+  const lrSel = LOST_REASONS.includes(lr0) ? lr0 : (d.lostReason ? "أخرى" : "");
+  const lrTxt = LOST_REASONS.includes(lr0) ? lrRest.join(" — ") : d.lostReason;
+  return `
     <dl class="facts">
       <dt>المسؤول</dt><dd>${admin
         ? `<select id="dOwner" aria-label="الموظف المسؤول">${members.map(p => `<option value="${esc(p.id)}" ${p.id === d.ownerId ? "selected" : ""}>${esc(p.full_name || p.email)}</option>`).join("")}</select>`
@@ -279,19 +356,24 @@ function drawer(id, refresh){
       ${d.location ? `<dt>الموقع</dt><dd>${esc(d.location)}</dd>` : ""}
       ${d.units ? `<dt>الوحدات</dt><dd>${esc(d.units)}</dd>` : ""}
       ${d.contract ? `<dt>العقد الحالي</dt><dd>${esc(d.contract)}</dd>` : ""}
+      ${d.contractEnd ? `<dt>انتهاء العقد</dt><dd>${esc(d.contractEnd)} ${rn ? `<span class="pill ${rn.k}">${esc(rn.t)}</span>` : ""}</dd>` : ""}
+      ${d.lostReason ? `<dt>سبب الاعتذار</dt><dd>${esc(d.lostReason)}</dd>` : ""}
       ${d.lastActivity ? `<dt>آخر نشاط</dt><dd>${esc(d.lastActivity)}</dd>` : ""}
       ${d.dateBasis ? `<dt>أساس الموعد</dt><dd>${esc(d.dateBasis)}</dd>` : ""}
       ${d.updatedBy ? `<dt>آخر تعديل</dt><dd>${esc(who(d.updatedBy))} · ${esc((d.updatedAt || "").slice(0,10))}</dd>` : ""}
     </dl>
     <div class="box"><h4>جهات التواصل</h4>
-      ${d.contacts.map(c => `<div class="contact"><span>${esc(c.name)}${c.role ? ` <small class="note">(${esc(c.role)})</small>` : ""}</span>
-        <span><span class="phone">${esc(c.phone)}</span> <button class="btn ghost" data-copy="${esc(c.phone)}">نسخ</button>${canEdit ? ` <button class="btn ghost" data-delc="${esc(c.id)}" aria-label="حذف جهة التواصل">حذف</button>` : ""}</span></div>`).join("") || '<span class="note">لا توجد جهة تواصل مسجلة.</span>'}
+      ${d.contacts.map(c => { const n = intlNum(c.phone); return `<div class="contact"><span>${esc(c.name)}${c.role ? ` <small class="note">(${esc(c.role)})</small>` : ""}</span>
+        <span class="tools"><span class="phone">${esc(c.phone)}</span>
+          ${n ? `<a class="btn ghost call" href="tel:+${n}" data-call="اتصال">اتصال</a><a class="btn ghost wa" href="https://wa.me/${n}" target="_blank" rel="noopener noreferrer" data-call="واتساب">واتساب</a>` : ""}
+          <button class="btn ghost" data-copy="${esc(c.phone)}">نسخ</button>${canEdit ? `<button class="btn ghost" data-delc="${esc(c.id)}" aria-label="حذف جهة التواصل">حذف</button>` : ""}</span></div>`; }).join("") || '<span class="note">لا توجد جهة تواصل مسجلة.</span>'}
       <div class="three" ${canEdit ? "" : "hidden"}>
         <div class="field"><label for="cName">الاسم</label><input id="cName"></div>
         <div class="field"><label for="cPhone">الجوال</label><input id="cPhone" inputmode="tel" dir="ltr"></div>
         <div class="field"><label for="cRole">الصفة</label><input id="cRole" placeholder="مالك، رئيس الجمعية…"></div>
         <button class="btn ghost" id="addC">إضافة</button>
       </div>
+      <div class="status err" id="cDup" role="status"></div>
     </div>
     <div class="box" ${canEdit ? "" : "hidden"}><h4>تسجيل ما حدث</h4>
       <div class="two">
@@ -307,34 +389,56 @@ function drawer(id, refresh){
         <div class="field"><label for="nStage">المرحلة</label><select id="nStage">${STAGES.map(s => `<option ${s === d.stage ? "selected" : ""}>${s}</option>`).join("")}</select></div>
         <div class="field"><label for="nPr">الأولوية</label><select id="nPr">${["","عالية","متوسطة","منخفضة"].map(p => `<option value="${p}" ${p === (d.priority || "") ? "selected" : ""}>${p || "—"}</option>`).join("")}</select></div>
       </div>
+      <div class="two" id="lostBox" hidden>
+        <div class="field"><label for="nLost">سبب الاعتذار أو التوقف (مطلوب)</label><select id="nLost"><option value="">اختر السبب</option>${LOST_REASONS.map(r => `<option ${r === lrSel ? "selected" : ""}>${r}</option>`).join("")}</select></div>
+        <div class="field"><label for="nLostTxt">تفاصيل السبب</label><input id="nLostTxt" value="${esc(lrTxt)}" placeholder="مثال: تعاقدوا مع شركة أخرى بسعر أقل"></div>
+      </div>
+      <div class="two">
+        <div class="field"><label for="nEnd">تاريخ انتهاء العقد الحالي</label><input type="date" id="nEnd" value="${esc(d.contractEnd)}"></div>
+        <div class="note" style="align-self:end">يُنبّهك النظام قبل انتهاء العقد بـ 90 و60 و30 يوماً لتجهيز عرض التجديد.</div>
+      </div>
       <div class="field"><label for="nNotes">ملاحظات</label><textarea id="nNotes" rows="2">${esc(d.notes)}</textarea></div>
       <button class="btn" id="save">حفظ</button>
-      <div class="status" id="st" role="status"></div>
     </div>
+    <div class="status" id="st" role="status"></div>
     <div class="box"><h4>السجل</h4><div class="hist">${hist.map(a => `<div><small>${esc(a.date)} · ${esc(a.type)}${a.createdBy ? " · " + esc(who(a.createdBy)) : ""}</small><br>${esc(a.summary)}</div>`).join("") || '<span class="note">لا يوجد نشاط مسجل.</span>'}</div></div>
     ${admin ? `<div class="box"><h4>حذف العميل</h4>${confirmDel
-      ? `<p class="note">سيُحذف العميل وجهات تواصله وسجله نهائياً.</p><div class="tools"><button class="btn danger" id="delYes">تأكيد الحذف</button><button class="btn ghost" id="delNo">إلغاء</button></div>`
+      ? `<p class="note">سيُحذف العميل وجهات تواصله وسجله وعروضه ومعايناته ومرفقاته نهائياً.</p><div class="tools"><button class="btn danger" id="delYes">تأكيد الحذف</button><button class="btn ghost" id="delNo">إلغاء</button></div>`
       : `<button class="btn ghost" id="delDeal">حذف هذا العميل</button>`}</div>` : ""}`;
-  el.hidden = false; $("#scrim").hidden = false;
-  $("#dx").onclick = closeDrawer;
+}
+function wireMain(d){
+  const el = $("#drawer");
   $("#save").onclick = () => save(d);
   $("#addC").onclick = () => addContact(d);
+  const toggleLost = () => { $("#lostBox").hidden = !LOST.has($("#nStage").value); };
+  $("#nStage").onchange = toggleLost; toggleLost();
+  $("#cPhone").oninput = () => { dupOk = false; $("#cDup").textContent = ""; };
+  $("#cPhone").onblur = async () => { const w = await dupInfo($("#cPhone").value, d.id); if ($("#cDup")) $("#cDup").textContent = w; };
+  el.querySelectorAll("[data-call]").forEach(a => a.addEventListener("click", () => { if ($("#aType")) $("#aType").value = a.dataset.call; }));
   if ($("#dOwner")) $("#dOwner").onchange = async e => {
-    const to = e.target.value, st = $("#st");
+    const to = e.target.value;
     const { error } = await sb.from("deals").update({ owner_id: to }).eq("id", d.id);
-    if (error) { e.target.value = d.ownerId; return setSt(st, errMsg(error), true); }
+    if (error) { e.target.value = d.ownerId; return setSt($("#st"), errMsg(error), true); }
     await load(); setSt($("#st"), `نُقل العميل إلى ${who(to)}.`);
   };
   el.querySelectorAll("[data-delc]").forEach(b => b.onclick = () => delContact(b.dataset.delc));
-  if ($("#delDeal")) $("#delDeal").onclick = () => { confirmDel = true; drawer(id); };
-  if ($("#delNo")) $("#delNo").onclick = () => { confirmDel = false; drawer(id); };
+  if ($("#delDeal")) $("#delDeal").onclick = () => { confirmDel = true; drawer(d.id); };
+  if ($("#delNo")) $("#delNo").onclick = () => { confirmDel = false; drawer(d.id); };
   if ($("#delYes")) $("#delYes").onclick = () => delDeal(d);
 }
 
 async function save(d){
   const st = $("#st"), btn = $("#save");
-  const sum = $("#aSum").value.trim(), date = $("#aDate").value || T, type = $("#aType").value;
-  const upd = { next_step: $("#nStep").value.trim(), next_date: $("#nDate").value || null, stage: $("#nStage").value, priority: $("#nPr").value, notes: $("#nNotes").value.trim(), updated_by: me.id };
+  const sum = $("#aSum").value.trim(), date = $("#aDate").value || T, type = $("#aType").value, stage = $("#nStage").value;
+  let lost = "";
+  if (LOST.has(stage)) {
+    const r = $("#nLost").value, t = $("#nLostTxt").value.trim();
+    if (!r && !LOST.has(d.stage)) { $("#nLost").focus(); return setSt(st, "اختر سبب الاعتذار أو التوقف قبل الحفظ.", true); }
+    if (r === "أخرى" && !t) { $("#nLostTxt").focus(); return setSt(st, "اكتب سبب الاعتذار في خانة التفاصيل.", true); }
+    lost = r ? (t && r !== "أخرى" ? r + " — " + t : (r === "أخرى" ? t : r)) : d.lostReason;
+  }
+  const upd = { next_step: $("#nStep").value.trim(), next_date: $("#nDate").value || null, stage, priority: $("#nPr").value, notes: $("#nNotes").value.trim(),
+    contract_end: $("#nEnd").value || null, lost_reason: lost, updated_by: me.id };
   if (sum) { upd.last_action = type + ": " + sum.slice(0,80); if (!d.lastActivity || date > d.lastActivity) upd.last_activity = date; }
   if ((upd.next_date || "") !== (d.nextDate || "")) upd.date_basis = "";
   btn.disabled = true; setSt(st, "جارٍ الحفظ…");
@@ -350,9 +454,21 @@ async function save(d){
   } catch (e) { setSt(st, errMsg(e), true); }
   finally { btn.disabled = false; }
 }
+// من يتابع هذا الرقم؟ الخادم يعيد اسم الموظف المسؤول فقط (واسم العميل للمدير أو لصاحب العميل)
+async function dupInfo(phone, exceptDeal){
+  if (String(phone || "").replace(/\D/g, "").length < 9) return "";
+  const { data, error } = await sb.rpc("phone_owner", { p_phone: phone, p_except_deal: exceptDeal || null });
+  if (error || !data || !data.length) return "";
+  return "تنبيه: هذا الرقم مسجّل مسبقاً " + data.map(r => r.same_owner ? `عندك في «${r.deal_name}»` : `لدى ${r.owner_name}${r.deal_name ? ` في «${r.deal_name}»` : ""}`).join("، ") + ".";
+}
 async function addContact(d){
   const name = $("#cName").value.trim(), phone = $("#cPhone").value.trim(), role = $("#cRole").value.trim(), st = $("#st");
   if (!name && !phone) return setSt(st, "اكتب اسم جهة التواصل أو رقمها.", true);
+  if (phone && !dupOk) {
+    const w = await dupInfo(phone, d.id);
+    if (w) { dupOk = true; $("#cDup").textContent = w + " اضغط «إضافة» مرة أخرى لإضافته على أي حال."; return; }
+  }
+  dupOk = false;
   const { error } = await sb.from("contacts").insert({ deal_id: d.id, name, phone, role, sort_order: d.contacts.length });
   if (error) return setSt(st, errMsg(error), true);
   await load(); setSt($("#st"), "أُضيفت جهة التواصل.");
@@ -364,11 +480,204 @@ async function delContact(cid){
 }
 async function delDeal(d){
   try {
+    const paths = files.filter(f => f.deal_id === d.id).map(f => f.path);
+    if (paths.length) { const s = await sb.storage.from("attachments").remove(paths); if (s.error) throw s.error; }
     let r = await sb.from("activity").delete().eq("deal_id", d.id); if (r.error) throw r.error;
     r = await sb.from("contacts").delete().eq("deal_id", d.id); if (r.error) throw r.error;
     r = await sb.from("deals").delete().eq("id", d.id); if (r.error) throw r.error;
     confirmDel = false; closeDrawer(); await load();
   } catch (e) { setSt($("#st"), errMsg(e), true); }
+}
+// سجل نشاط تلقائي مع تحديث آخر إجراء للعميل
+async function logAuto(d, type, summary, extra){
+  const r = await sb.from("activity").insert({ deal_id: d.id, date: T, type, contact: d.contacts[0]?.name || "", summary, source: "التطبيق", created_by: me.id });
+  if (r.error) throw r.error;
+  const upd = Object.assign({ last_action: type + ": " + summary.slice(0,80), updated_by: me.id }, extra || {});
+  if (!d.lastActivity || T > d.lastActivity) upd.last_activity = T;
+  const u = await sb.from("deals").update(upd).eq("id", d.id); if (u.error) throw u.error;
+}
+
+/* ---- تبويب عروض الأسعار ---- */
+function nextQuoteNo(d){
+  const code = CITY[Object.keys(CITY).find(k => (d.location || "").includes(k))] || "XXX";
+  const max = quotes.reduce((m, q) => { const x = /(\d{3,})\s*$/.exec(q.number || ""); return x ? Math.max(m, Number(x[1])) : m; }, 0);
+  return `Q-Resi-${code}-${String(max + 1).padStart(4, "0")}`;
+}
+function quotesHTML(d, dq, canEdit, admin){
+  const openQ = dq.find(q => Q_OPEN.has(q.status));
+  return `
+    ${openQ ? `<div class="box hl"><h4>العرض المفتوح الحالي</h4><div class="qv"><b>${money(openQ.annual_value)}</b> <span class="note">سنوياً · ${esc(openQ.number)} · ${esc(openQ.status)}</span></div></div>` : ""}
+    <div class="box"><h4>عروض الأسعار المقدّمة</h4>
+      ${dq.map(q => `<div class="qrow">
+        <div><b dir="ltr">${esc(q.number || "—")}</b><div class="note">${esc(q.quote_date)}${q.created_by ? " · " + esc(who(q.created_by)) : ""}</div>${q.notes ? `<div class="note">${esc(q.notes)}</div>` : ""}</div>
+        <div class="qv"><b>${money(q.annual_value)}</b><small>${q.vat_included ? "شامل الضريبة" : "غير شامل الضريبة"}</small></div>
+        <div class="tools">${canEdit ? `<select data-qst="${esc(q.id)}" aria-label="حالة العرض">${Q_STATUS.map(s => `<option ${s === q.status ? "selected" : ""}>${s}</option>`).join("")}</select>` : `<span class="pill ${q.status === "مقبول" ? "ok" : q.status === "مرفوض" ? "due" : ""}">${esc(q.status)}</span>`}
+          ${admin ? `<button class="btn ghost" data-qdel="${esc(q.id)}">حذف</button>` : ""}</div>
+      </div>`).join("") || '<p class="note">لم يُسجَّل أي عرض سعر لهذا العميل بعد.</p>'}
+    </div>
+    <div class="box" ${canEdit ? "" : "hidden"}><h4>تسجيل عرض سعر</h4>
+      <div class="two">
+        <div class="field"><label for="qNo">رقم العرض</label><input id="qNo" dir="ltr" value="${esc(nextQuoteNo(d))}"></div>
+        <div class="field"><label for="qVal">القيمة السنوية (ر.س)</label><input id="qVal" inputmode="decimal" dir="ltr" placeholder="120000"></div>
+      </div>
+      <div class="two">
+        <div class="field"><label for="qDate">تاريخ العرض</label><input type="date" id="qDate" value="${T}"></div>
+        <div class="field"><label for="qSt">الحالة</label><select id="qSt">${Q_STATUS.map(s => `<option ${s === "مُرسل" ? "selected" : ""}>${s}</option>`).join("")}</select></div>
+      </div>
+      <label class="chk"><input type="checkbox" id="qVat" checked> القيمة شاملة ضريبة القيمة المضافة</label>
+      <div class="field"><label for="qNotes">ملاحظات</label><input id="qNotes" placeholder="مثال: يشمل النظافة والحراسة، بدون صيانة المصاعد"></div>
+      <button class="btn" id="qAdd">حفظ العرض</button>
+      <p class="note">لإرفاق ملف العرض (PDF) استخدم تبويب «المرفقات». عند حفظ عرض مُرسل تنتقل مرحلة العميل إلى «تم تقديم عرض» تلقائياً.</p>
+    </div>
+    <div class="status" id="st" role="status"></div>`;
+}
+function wireQuotes(d){
+  const el = $("#drawer"), st = () => $("#st");
+  if ($("#qAdd")) $("#qAdd").onclick = async () => {
+    const number = $("#qNo").value.trim(), vRaw = $("#qVal").value.replace(/[,،٬\s]/g, "").replace(/٫/g, ".").replace(/[٠-٩]/g, c => "٠١٢٣٤٥٦٧٨٩".indexOf(c));
+    const status = $("#qSt").value, value = vRaw === "" ? null : Number(vRaw);
+    if (!number) return setSt(st(), "اكتب رقم العرض.", true);
+    if (value !== null && (!isFinite(value) || value < 0)) return setSt(st(), "اكتب القيمة بالأرقام فقط.", true);
+    $("#qAdd").disabled = true; setSt(st(), "جارٍ الحفظ…");
+    try {
+      const r = await sb.from("quotes").insert({ deal_id: d.id, number, annual_value: value, vat_included: $("#qVat").checked, quote_date: $("#qDate").value || T, status, notes: $("#qNotes").value.trim(), created_by: me.id });
+      if (r.error) throw r.error;
+      const extra = Q_OPEN.has(status) && ["جديد","مهتم","قيد المتابعة"].includes(d.stage) ? { stage: "تم تقديم عرض" } : {};
+      await logAuto(d, "عرض سعر", `عرض سعر ${number}${value !== null ? " بقيمة " + money(value) : ""} (${status})`, extra);
+      await load(); setSt($("#st"), "تم حفظ العرض" + (extra.stage ? " ونُقل العميل إلى «تم تقديم عرض»." : "."));
+    } catch (e) { setSt(st(), errMsg(e), true); $("#qAdd").disabled = false; }
+  };
+  el.querySelectorAll("[data-qst]").forEach(s => s.onchange = async () => {
+    const q = quotes.find(x => x.id === s.dataset.qst), to = s.value;
+    const { error } = await sb.from("quotes").update({ status: to }).eq("id", q.id);
+    if (error) { s.value = q.status; return setSt(st(), errMsg(error), true); }
+    try { await logAuto(d, "عرض سعر", `تغيّرت حالة العرض ${q.number} إلى «${to}»`); } catch (_) {}
+    await load();
+    setSt($("#st"), to === "مقبول" && d.stage !== "تم التعاقد" ? "مبروك! حدّث مرحلة العميل إلى «تم التعاقد» من تبويب المتابعة." : "تم تحديث حالة العرض.");
+  });
+  el.querySelectorAll("[data-qdel]").forEach(b => b.onclick = async () => {
+    if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.textContent = "تأكيد الحذف"; b.classList.add("danger"); return; }
+    const { error } = await sb.from("quotes").delete().eq("id", b.dataset.qdel);
+    if (error) return setSt(st(), errMsg(error), true);
+    await load();
+  });
+}
+
+/* ---- تبويب المعاينة ---- */
+function inspHTML(d, di, canEdit, admin){
+  const photos = files.filter(f => f.deal_id === d.id && f.kind === "صورة الموقع");
+  const fld = ([k, l, t]) => {
+    const input = t === "num" ? `<input id="i_${k}" inputmode="numeric" dir="ltr">`
+      : `<select id="i_${k}"><option value="">—</option>${(t === "yn" ? ["نعم","لا"] : t.split("|")).map(o => `<option>${o}</option>`).join("")}</select>`;
+    return `<div class="field"><label for="i_${k}">${l}</label>${input}</div>`;
+  };
+  return `
+    <div class="box"><h4>المعاينات السابقة</h4>
+      ${di.map(x => `<div class="insp">
+        <div class="contact"><b>معاينة ${esc(x.visit_date)}</b><span class="note">${esc(who(x.created_by))}${admin ? ` <button class="btn ghost" data-idel="${esc(x.id)}">حذف</button>` : ""}</span></div>
+        <div class="chips">${inspChips(x.data) || '<span class="note">بدون بيانات تفصيلية.</span>'}</div>
+        ${x.notes ? `<div class="note">${esc(x.notes)}</div>` : ""}
+      </div>`).join("") || '<p class="note">لم تُسجَّل معاينة لهذا العميل بعد.</p>'}
+      ${photos.length ? `<h4>صور الموقع</h4><div class="thumbs">${photos.map(f => `<a data-path="${esc(f.path)}" target="_blank" rel="noopener noreferrer" title="${esc(f.name)}"><img data-path="${esc(f.path)}" alt="${esc(f.name)}"></a>`).join("")}</div>` : ""}
+    </div>
+    <div class="box" ${canEdit ? "" : "hidden"}><h4>نموذج معاينة جديدة</h4>
+      <div class="field"><label for="iDate">تاريخ المعاينة</label><input type="date" id="iDate" value="${T}"></div>
+      <div class="grid3">${INSP.map(fld).join("")}</div>
+      <div class="field"><label for="iNotes">ملاحظات المعاينة</label><textarea id="iNotes" rows="3" placeholder="مثال: الواجهات تحتاج تنظيف، تسربات في القبو، المصعد رقم 2 متوقف"></textarea></div>
+      <div class="field"><label for="iPhotos">صور الموقع (اختياري)</label><input type="file" id="iPhotos" accept="image/*" multiple></div>
+      <button class="btn" id="iSave">حفظ المعاينة</button>
+    </div>
+    <div class="status" id="st" role="status"></div>`;
+}
+function wireInsp(d){
+  const el = $("#drawer"), st = () => $("#st");
+  if ($("#iSave")) $("#iSave").onclick = async () => {
+    const data = {};
+    INSP.forEach(([k]) => { const v = $("#i_" + k).value.trim(); if (v) data[k] = v; });
+    const notes = $("#iNotes").value.trim(), photos = [...$("#iPhotos").files];
+    if (!Object.keys(data).length && !notes && !photos.length) return setSt(st(), "عبّئ بند واحد على الأقل أو اكتب ملاحظة.", true);
+    $("#iSave").disabled = true; setSt(st(), photos.length ? `جارٍ الحفظ ورفع ${photos.length} صورة…` : "جارٍ الحفظ…");
+    try {
+      const r = await sb.from("inspections").insert({ deal_id: d.id, visit_date: $("#iDate").value || T, data, notes, created_by: me.id });
+      if (r.error) throw r.error;
+      if (photos.length) await uploadFiles(d, photos, "صورة الموقع");
+      const brief = ["elevators","gates","parking"].filter(k => data[k]).map(k => `${INSP_L[k]} ${data[k]}`).join("، ");
+      await logAuto(d, "معاينة", "تمت معاينة الموقع" + (brief ? ": " + brief : "") + (notes ? " — " + notes.slice(0,60) : ""));
+      $("#iPhotos").value = "";
+      await load(); setSt($("#st"), "تم حفظ المعاينة.");
+    } catch (e) { setSt(st(), errMsg(e), true); $("#iSave").disabled = false; }
+  };
+  el.querySelectorAll("[data-idel]").forEach(b => b.onclick = async () => {
+    if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.textContent = "تأكيد الحذف"; b.classList.add("danger"); return; }
+    const { error } = await sb.from("inspections").delete().eq("id", b.dataset.idel);
+    if (error) return setSt(st(), errMsg(error), true);
+    await load();
+  });
+}
+
+/* ---- تبويب المرفقات ---- */
+const isImg = f => /^image\//.test(f.mime || "") || /\.(jpe?g|png|webp)$/i.test(f.name || "");
+function filesHTML(d, df, canEdit, admin){
+  return `
+    <div class="box"><h4>ملفات العميل</h4>
+      ${df.map(f => `<div class="frow">
+        ${isImg(f) ? `<a data-path="${esc(f.path)}" target="_blank" rel="noopener noreferrer"><img class="fthumb" data-path="${esc(f.path)}" alt=""></a>` : `<span class="ficon">${esc(((f.name || "").split(".").pop() || "ملف").slice(0,4).toUpperCase())}</span>`}
+        <div><a class="flink" data-path="${esc(f.path)}" target="_blank" rel="noopener noreferrer">${esc(f.name)}</a>
+          <div class="note"><span class="pill">${esc(f.kind)}</span> ${esc(kb(f.size))} · ${esc((f.created_at || "").slice(0,10))}${f.created_by ? " · " + esc(who(f.created_by)) : ""}</div></div>
+        ${admin ? `<button class="btn ghost" data-fdel="${esc(f.id)}">حذف</button>` : "<span></span>"}
+      </div>`).join("") || '<p class="note">لا توجد مرفقات بعد. أرفق عرض السعر أو العقد أو صور الموقع.</p>'}
+    </div>
+    <div class="box" ${canEdit ? "" : "hidden"}><h4>إرفاق ملف</h4>
+      <div class="two">
+        <div class="field"><label for="fKind">نوع الملف</label><select id="fKind">${FILE_KINDS.map(k => `<option>${k}</option>`).join("")}</select></div>
+        <div class="field"><label for="fIn">الملف (حتى 15 ميغابايت)</label><input type="file" id="fIn" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,image/*"></div>
+      </div>
+      <button class="btn" id="fUp">رفع</button>
+      <p class="note">الملفات محفوظة في مساحة خاصة؛ لا يفتحها إلا من له صلاحية على هذا العميل، والروابط تنتهي بعد ساعة.</p>
+    </div>
+    <div class="status" id="st" role="status"></div>`;
+}
+async function uploadFiles(d, list, kind){
+  for (const f of list) {
+    if (f.size > 15 * 1048576) throw new Error("file_too_big");
+    const m = /\.([a-z0-9]{1,5})$/i.exec(f.name || ""), ext = m ? "." + m[1].toLowerCase() : "";
+    const path = `${d.id}/${crypto.randomUUID()}${ext}`;
+    const up = await sb.storage.from("attachments").upload(path, f, { contentType: f.type || undefined, upsert: false });
+    if (up.error) throw up.error;
+    const r = await sb.from("attachments").insert({ deal_id: d.id, path, name: (f.name || "ملف").slice(0,200), size: f.size, mime: f.type || "", kind, created_by: me.id });
+    if (r.error) throw r.error;
+  }
+}
+function wireFiles(d){
+  const el = $("#drawer"), st = () => $("#st");
+  if ($("#fUp")) $("#fUp").onclick = async () => {
+    const list = [...$("#fIn").files];
+    if (!list.length) return setSt(st(), "اختر ملفاً أولاً.", true);
+    $("#fUp").disabled = true; setSt(st(), `جارٍ رفع ${list.length} ملف…`);
+    try { await uploadFiles(d, list, $("#fKind").value); $("#fIn").value = ""; await load(); setSt($("#st"), "تم الرفع."); }
+    catch (e) { setSt(st(), errMsg(e), true); $("#fUp").disabled = false; }
+  };
+  el.querySelectorAll("[data-fdel]").forEach(b => b.onclick = async () => {
+    if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.textContent = "تأكيد الحذف"; b.classList.add("danger"); return; }
+    const f = files.find(x => x.id === b.dataset.fdel);
+    const s = await sb.storage.from("attachments").remove([f.path]);
+    if (s.error) return setSt(st(), errMsg(s.error), true);
+    const { error } = await sb.from("attachments").delete().eq("id", f.id);
+    if (error) return setSt(st(), errMsg(error), true);
+    await load();
+  });
+}
+// روابط مؤقتة (ساعة) للملفات الخاصة
+const urlCache = {};
+async function fillLinks(root){
+  const nodes = [...root.querySelectorAll("[data-path]")]; if (!nodes.length) return;
+  const now = Date.now();
+  const need = [...new Set(nodes.map(n => n.dataset.path))].filter(p => !urlCache[p] || urlCache[p].exp < now + 120000);
+  if (need.length) {
+    const { data } = await sb.storage.from("attachments").createSignedUrls(need, 3600);
+    (data || []).forEach(x => { if (x.signedUrl && x.path) urlCache[x.path] = { url: x.signedUrl, exp: now + 3600000 }; });
+  }
+  nodes.forEach(n => { const c = urlCache[n.dataset.path]; if (!c) return; if (n.tagName === "IMG") n.src = c.url; else n.href = c.url; });
 }
 
 /* ================= عميل جديد ================= */
@@ -387,12 +696,16 @@ $("#newDeal").onclick = () => {
         <div class="field"><label for="ndSrc">مصدر العميل</label><select id="ndSrc">${SOURCES.map(s => `<option>${s}</option>`).join("")}</select></div>
         <div class="field"><label for="ndPr">الأولوية</label><select id="ndPr"><option value="">—</option><option>عالية</option><option>متوسطة</option><option>منخفضة</option></select></div>
       </div>
-      <div class="field"><label for="ndContract">العقد الحالي</label><input id="ndContract" placeholder="مثال: عقد ينتهي 12-2026"></div>
+      <div class="two">
+        <div class="field"><label for="ndContract">العقد الحالي</label><input id="ndContract" placeholder="مثال: عقد مع شركة أخرى"></div>
+        <div class="field"><label for="ndEnd">تاريخ انتهاء العقد</label><input type="date" id="ndEnd"></div>
+      </div>
       ${isAdmin() ? `<div class="field"><label for="ndOwner">الموظف المسؤول</label><select id="ndOwner">${Object.values(people).filter(p => p.active).map(p => `<option value="${esc(p.id)}" ${p.id === me.id ? "selected" : ""}>${esc(p.id === me.id ? "أنا" : (p.full_name || p.email))}</option>`).join("")}</select></div>` : ""}
       <div class="two">
         <div class="field"><label for="ndCName">جهة التواصل</label><input id="ndCName"></div>
         <div class="field"><label for="ndCPhone">الجوال</label><input id="ndCPhone" inputmode="tel" dir="ltr"></div>
       </div>
+      <div class="status err" id="ndDup" role="status"></div>
       <div class="two">
         <div class="field"><label for="ndStep">الخطوة التالية</label><input id="ndStep" placeholder="اتصال تعريفي"></div>
         <div class="field"><label for="ndDate">موعدها</label><input type="date" id="ndDate" value="${T}"></div>
@@ -403,22 +716,30 @@ $("#newDeal").onclick = () => {
     </div>`;
   el.hidden = false; $("#scrim").hidden = false;
   $("#dx").onclick = closeDrawer;
+  dupOk = false;
+  $("#ndCPhone").oninput = () => { dupOk = false; $("#ndDup").textContent = ""; };
+  $("#ndCPhone").onblur = async () => { const w = await dupInfo($("#ndCPhone").value); if ($("#ndDup")) $("#ndDup").textContent = w; };
   $("#ndSave").onclick = async () => {
     const st = $("#ndSt"), name = $("#ndName").value.trim();
     if (!name) return setSt(st, "اكتب اسم العميل.", true);
+    const same = deals.find(x => x.name.trim() === name);
+    if (!dupOk) {
+      const w = [same ? `يوجد عميل بنفس الاسم «${same.name}».` : "", await dupInfo($("#ndCPhone").value)].filter(Boolean).join(" ");
+      if (w) { dupOk = true; $("#ndDup").textContent = w + " اضغط «إضافة العميل» مرة أخرى لإضافته على أي حال."; return; }
+    }
     $("#ndSave").disabled = true; setSt(st, "جارٍ الحفظ…");
     try {
       const order = deals.reduce((m, d) => Math.max(m, d.order || 0), 0) + 1;
       const { data, error } = await sb.from("deals").insert({
         name, location: $("#ndLoc").value.trim(), units: $("#ndUnits").value.trim(), source: $("#ndSrc").value, priority: $("#ndPr").value,
-        contract: $("#ndContract").value.trim(), next_step: $("#ndStep").value.trim(), next_date: $("#ndDate").value || null,
+        contract: $("#ndContract").value.trim(), contract_end: $("#ndEnd").value || null, next_step: $("#ndStep").value.trim(), next_date: $("#ndDate").value || null,
         notes: $("#ndNotes").value.trim(), stage: "جديد", sort_order: order, updated_by: me.id,
         owner_id: $("#ndOwner") ? $("#ndOwner").value : me.id
       }).select("id").single();
       if (error) throw error;
       const cn = $("#ndCName").value.trim(), cp = $("#ndCPhone").value.trim();
       if (cn || cp) { const r = await sb.from("contacts").insert({ deal_id: data.id, name: cn, phone: cp, sort_order: 0 }); if (r.error) throw r.error; }
-      await load(); drawer(data.id);
+      await load(); dtab = "main"; dupOk = false; drawer(data.id);
     } catch (e) { setSt(st, errMsg(e), true); $("#ndSave").disabled = false; }
   };
   $("#ndName").focus();
@@ -454,11 +775,14 @@ $("#invAdd").onclick = async () => {
 };
 
 /* ================= سجل المراقبة (للمدير) ================= */
-const TBL_AR = { deals: "العملاء", contacts: "جهات التواصل", activity: "النشاط", profiles: "الفريق", invites: "الدعوات", settings: "الإعدادات" };
+const TBL_AR = { deals: "العملاء", contacts: "جهات التواصل", activity: "النشاط", profiles: "الفريق", invites: "الدعوات", settings: "الإعدادات",
+  quotes: "عروض الأسعار", inspections: "المعاينات", attachments: "المرفقات", access_grants: "الصلاحيات" };
 const OP_AR = { INSERT: "إضافة", UPDATE: "تعديل", DELETE: "حذف" };
 const FIELD_AR = { name: "الاسم", location: "الموقع", units: "الوحدات", contract: "العقد", source: "المصدر", stage: "المرحلة", priority: "الأولوية",
   last_action: "آخر إجراء", next_step: "الخطوة التالية", next_date: "موعدها", notes: "ملاحظات", phone: "الجوال", role: "الصفة/الصلاحية",
-  active: "مفعّل", full_name: "الاسم", summary: "الملخص", type: "النوع", date: "التاريخ", last_activity: "آخر نشاط", date_basis: "أساس الموعد", email: "البريد", sort_order: "الترتيب" };
+  active: "مفعّل", full_name: "الاسم", summary: "الملخص", type: "النوع", date: "التاريخ", last_activity: "آخر نشاط", date_basis: "أساس الموعد", email: "البريد", sort_order: "الترتيب",
+  contract_end: "انتهاء العقد", lost_reason: "سبب الاعتذار", number: "رقم العرض", annual_value: "القيمة السنوية", status: "الحالة", quote_date: "تاريخ العرض",
+  vat_included: "شامل الضريبة", visit_date: "تاريخ المعاينة", data: "بيانات المعاينة", kind: "النوع", size: "الحجم", mime: "نوع الملف", path: "المسار", owner_id: "المسؤول", level: "الصلاحية" };
 const SKIP = new Set(["updated_at","updated_by","created_at","created_by","id","deal_id"]);
 let auditRows = [], auditPage = 0;
 const fmtTs = s => { try { return new Intl.DateTimeFormat("ar-SA-u-ca-gregory-nu-latn", { dateStyle: "short", timeStyle: "short", timeZone: "Asia/Riyadh" }).format(new Date(s)); } catch (_) { return s; } };
@@ -468,6 +792,10 @@ function auditLabel(r){
   if (r.table_name === "deals") return d.name;
   if (r.table_name === "contacts") return [d.name, d.phone].filter(Boolean).join(" · ");
   if (r.table_name === "activity") return (deals.find(x => x.id === d.deal_id)?.name || "") + (d.summary ? " — " + short(d.summary) : "");
+  const dn = deals.find(x => x.id === d.deal_id)?.name || "";
+  if (r.table_name === "quotes") return [dn, d.number].filter(Boolean).join(" · ");
+  if (r.table_name === "inspections") return [dn, "معاينة " + (d.visit_date || "")].filter(Boolean).join(" · ");
+  if (r.table_name === "attachments") return [dn, d.name].filter(Boolean).join(" · ");
   return d.full_name || d.email || d.key || r.row_id;
 }
 function auditDetail(r){
@@ -614,6 +942,175 @@ function renderTeam(){
   });
 }
 
+/* ================= لوحة الأداء (للمدير) ================= */
+function renderDash(){
+  const latest = {}; quotes.forEach(q => { if (!latest[q.deal_id]) latest[q.deal_id] = q; });
+  const openQ = Object.values(latest).filter(q => Q_OPEN.has(q.status));
+  const acc = quotes.filter(q => q.status === "مقبول"), rej = quotes.filter(q => q.status === "مرفوض");
+  const sum = l => l.reduce((m, q) => m + Number(q.annual_value || 0), 0);
+  const pct = (a, b) => b ? Math.round(a / b * 100) + "%" : "—";
+  const won = deals.filter(d => d.stage === "تم التعاقد").length, lost = deals.filter(d => LOST.has(d.stage)).length;
+  const { dueNow, renew } = queueParts();
+  const since = addDays(T, -30);
+  const kpi = [
+    [money(sum(openQ)), `قيمة العروض المفتوحة (${openQ.length} عرض)`, ""],
+    [money(sum(acc)), `قيمة العروض المقبولة (${acc.length})`, ""],
+    [pct(acc.length, acc.length + rej.length), "نسبة قبول العروض", ""],
+    [pct(won, won + lost), `نسبة التحويل إلى عقد (${won} من ${won + lost} مغلق)`, ""],
+    [renew.length, "عقود تنتهي خلال 90 يوماً", renew.length ? "hot" : ""],
+    [dueNow.length, "متابعات مستحقة أو متأخرة", dueNow.length ? "hot" : ""]
+  ];
+  const staff = Object.values(people).filter(p => p.active || deals.some(d => d.ownerId === p.id));
+  const rows = staff.map(p => {
+    const my = deals.filter(d => d.ownerId === p.id), ids = new Set(my.map(d => d.id));
+    const oq = openQ.filter(q => ids.has(q.deal_id));
+    return `<tr><td><b>${esc(p.full_name || p.email)}</b></td><td>${my.length}</td><td>${my.filter(d => !CLOSED.has(d.stage)).length}</td>
+      <td class="${dueNow.some(d => ids.has(d.id)) ? "hotc" : ""}">${dueNow.filter(d => ids.has(d.id)).length}</td>
+      <td>${acts.filter(a => a.createdBy === p.id && a.date >= since).length}</td>
+      <td>${oq.length} · ${money(sum(oq))}</td><td>${quotes.filter(q => ids.has(q.deal_id) && q.status === "مقبول").length}</td>
+      <td>${my.filter(d => d.stage === "تم التعاقد").length}</td><td>${renew.filter(d => ids.has(d.id)).length}</td></tr>`;
+  }).join("");
+  const bars = (items) => { const max = Math.max(1, ...items.map(x => x[1])); return `<div class="dbars">${items.map(([l, n]) => `<div class="br"><span>${esc(l)}</span><div class="tr"><i style="width:${n / max * 100}%"></i></div><b>${n}</b></div>`).join("")}</div>`; };
+  const reasons = {};
+  deals.filter(d => LOST.has(d.stage)).forEach(d => { const r0 = (d.lostReason || "").split(" — ")[0]; const k = !d.lostReason ? "غير محدد" : LOST_REASONS.includes(r0) ? r0 : "أخرى"; reasons[k] = (reasons[k] || 0) + 1; });
+  const byId = Object.fromEntries(deals.map(d => [d.id, d]));
+  const topQ = openQ.slice().sort((a, b) => Number(b.annual_value || 0) - Number(a.annual_value || 0)).slice(0, 10);
+  $("#dash").innerHTML = `
+    <section class="stats">${kpi.map(([n, l, c]) => `<div class="stat ${c}"><b>${esc(n)}</b><span>${esc(l)}</span></div>`).join("")}</section>
+    <div class="box"><h4>أداء الموظفين</h4><div class="tbl"><table>
+      <thead><tr><th>الموظف</th><th>العملاء</th><th>مفتوحون</th><th>مستحقة/متأخرة</th><th>نشاط آخر 30 يوماً</th><th>عروض مفتوحة</th><th>عروض مقبولة</th><th>تعاقدات</th><th>عقود تنتهي ≤90 يوماً</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="9" class="empty">لا يوجد موظفون.</td></tr>'}</tbody></table></div></div>
+    <div class="dgrid">
+      <div class="box"><h4>العملاء حسب المرحلة</h4>${bars(STAGES.map(s => [s, deals.filter(d => d.stage === s).length]))}</div>
+      <div class="box"><h4>أسباب الاعتذار والتوقف</h4>${Object.keys(reasons).length ? bars(Object.entries(reasons).sort((a, b) => b[1] - a[1])) : '<p class="note">لا يوجد عملاء معتذرون أو متوقفون.</p>'}</div>
+    </div>
+    <div class="box"><h4>أكبر العروض المفتوحة</h4><div class="tbl"><table>
+      <thead><tr><th>العميل</th><th>رقم العرض</th><th>القيمة السنوية</th><th>الحالة</th><th>التاريخ</th><th>المسؤول</th></tr></thead>
+      <tbody>${topQ.map(q => `<tr class="click" data-open="${esc(q.deal_id)}"><td>${esc(byId[q.deal_id]?.name || "")}</td><td dir="ltr" style="text-align:right">${esc(q.number)}</td><td>${money(q.annual_value)}</td><td>${esc(q.status)}</td><td class="d">${esc(q.quote_date)}</td><td>${esc(who(byId[q.deal_id]?.ownerId))}</td></tr>`).join("") || '<tr><td colspan="6" class="empty">لا توجد عروض مفتوحة.</td></tr>'}</tbody></table></div></div>`;
+  $("#dash").querySelectorAll("[data-open]").forEach(r => r.onclick = () => { dtab = "quotes"; confirmDel = false; drawer(r.dataset.open); });
+}
+
+/* ================= Excel: تصدير واستيراد ================= */
+async function ensureXLSX(){ if (!window.XLSX) await loadScript("vendor/xlsx.full.min.js"); return window.XLSX; }
+const XCOLS = [
+  ["name", "اسم العميل", ["اسم العميل","العميل","اسم العميل أو العقار","العميل / العقار","العقار","اسم العقار","الاسم"]],
+  ["location", "الموقع", ["الموقع","الحي","العنوان","المدينة والحي"]],
+  ["units", "الوحدات", ["الوحدات","عدد الوحدات"]],
+  ["source", "المصدر", ["المصدر","مصدر العميل"]],
+  ["stage", "المرحلة", ["المرحلة","الحالة"]],
+  ["priority", "الأولوية", ["الأولوية"]],
+  ["owner", "المسؤول", []],
+  ["contract", "العقد الحالي", ["العقد الحالي","العقد","نوع الإدارة"]],
+  ["contract_end", "تاريخ انتهاء العقد", ["تاريخ انتهاء العقد","انتهاء العقد","نهاية العقد"]],
+  ["last_action", "آخر إجراء", ["آخر إجراء","اخر اجراء"]],
+  ["next_step", "الخطوة التالية", ["الخطوة التالية"]],
+  ["next_date", "موعد الخطوة", ["موعد الخطوة","موعدها","موعد الخطوة التالية","تاريخ المتابعة","موعد المتابعة"]],
+  ["last_activity", "آخر نشاط", []],
+  ["cname", "جهة التواصل", ["جهة التواصل","اسم جهة التواصل","اسم المسؤول","المالك"]],
+  ["phone", "الجوال", ["الجوال","رقم الجوال","الهاتف","رقم التواصل","رقم الهاتف"]],
+  ["lost_reason", "سبب الاعتذار/التوقف", ["سبب الاعتذار/التوقف","سبب الاعتذار"]],
+  ["notes", "ملاحظات", ["ملاحظات","الملاحظات"]]
+];
+const normH = h => String(h || "").replace(/[\s‎‏:*_\-/]/g, "").replace(/[أإآ]/g, "ا").replace(/ة/g, "ه").replace(/ى/g, "ي");
+function toISODate(v){
+  const s = String(v || "").trim(); if (!s) return null;
+  let m = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/.exec(s); if (m) return `${m[1]}-${m[2].padStart(2,"0")}-${m[3].padStart(2,"0")}`;
+  m = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/.exec(s); if (m) return `${m[3]}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;
+  m = /^(\d{1,2})[-/.](\d{4})$/.exec(s); if (m) { const d = new Date(Number(m[2]), Number(m[1]), 0); return iso(d); }
+  return null;
+}
+$("#xlsOut").onclick = async () => {
+  const st = $("#xlsSt");
+  try {
+    setSt(st, "جارٍ تجهيز الملف…");
+    const X = await ensureXLSX(), list = filteredDeals().slice().sort((a, b) => a.order - b.order);
+    const val = { owner: d => who(d.ownerId), cname: d => d.contacts.map(c => c.name).filter(Boolean).join(" / "), phone: d => d.contacts.map(c => c.phone).filter(Boolean).join(" / ") };
+    const key = { location: "location", units: "units", source: "source", stage: "stage", priority: "priority", contract: "contract", contract_end: "contractEnd", last_action: "lastAction", next_step: "nextStep", next_date: "nextDate", last_activity: "lastActivity", lost_reason: "lostReason", notes: "notes", name: "name" };
+    const rows = list.map(d => Object.fromEntries(XCOLS.map(([k, h]) => [h, val[k] ? val[k](d) : (d[key[k]] || "")])));
+    const ws = X.utils.json_to_sheet(rows, { header: XCOLS.map(c => c[1]) });
+    ws["!cols"] = XCOLS.map(([k]) => ({ wch: ["name","last_action","next_step","notes","contract"].includes(k) ? 30 : k === "phone" || k === "cname" ? 22 : 14 }));
+    const ids = new Set(list.map(d => d.id)), byId = Object.fromEntries(deals.map(d => [d.id, d]));
+    const qs = X.utils.json_to_sheet(quotes.filter(q => ids.has(q.deal_id)).map(q => ({ "العميل": byId[q.deal_id]?.name || "", "رقم العرض": q.number, "القيمة السنوية": q.annual_value === null ? "" : Number(q.annual_value), "شامل الضريبة": q.vat_included ? "نعم" : "لا", "تاريخ العرض": q.quote_date, "الحالة": q.status, "ملاحظات": q.notes })),
+      { header: ["العميل","رقم العرض","القيمة السنوية","شامل الضريبة","تاريخ العرض","الحالة","ملاحظات"] });
+    qs["!cols"] = [{ wch: 30 }, { wch: 20 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 30 }];
+    const wb = X.utils.book_new(); wb.Workbook = { Views: [{ RTL: true }] };
+    X.utils.book_append_sheet(wb, ws, "العملاء"); X.utils.book_append_sheet(wb, qs, "عروض الأسعار");
+    wb.Props = { Title: "عملاء توتال", Author: "رامي هادي رياني", Company: "توتال لإدارة المرافق" };
+    X.writeFile(wb, `عملاء توتال ${T}.xlsx`);
+    setSt(st, `تم تصدير ${rows.length} عميل.`);
+  } catch (e) { setSt(st, "تعذّر التصدير. حاول مرة أخرى.", true); }
+};
+$("#xlsIn").onclick = () => { $("#xlsFile").value = ""; $("#xlsFile").click(); };
+$("#xlsFile").onchange = async () => {
+  const f = $("#xlsFile").files[0], st = $("#xlsSt"); if (!f) return;
+  if (f.size > 5 * 1048576) return setSt(st, "الملف كبير جداً (الحد 5 ميغابايت).", true);
+  setSt(st, "جارٍ قراءة الملف…");
+  try {
+    const X = await ensureXLSX();
+    const wb = X.read(await f.arrayBuffer(), { type: "array", cellDates: true });
+    const raw = X.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "", raw: false, dateNF: "yyyy-mm-dd" });
+    if (!raw.length) return setSt(st, "الملف فارغ.", true);
+    const alias = {}; XCOLS.forEach(([k, , al]) => al.forEach(a => { alias[normH(a)] = k; }));
+    const heads = Object.keys(raw[0]), map = {}; heads.forEach(h => { const k = alias[normH(h)]; if (k && !map[k]) map[k] = h; });
+    if (!map.name) return setSt(st, "لم أجد عمود «اسم العميل» في الملف. اجعل أول صف عناوين الأعمدة.", true);
+    const g = (r, k) => map[k] ? String(r[map[k]] ?? "").trim() : "";
+    const names = new Set(deals.map(d => d.name.trim()));
+    const items = raw.slice(0, 500).map(r => ({
+      name: g(r, "name").slice(0, 200), location: g(r, "location"), units: g(r, "units"),
+      source: SOURCES.includes(g(r, "source")) ? g(r, "source") : "", stage: STAGES.includes(g(r, "stage")) ? g(r, "stage") : "جديد",
+      priority: ["عالية","متوسطة","منخفضة"].includes(g(r, "priority")) ? g(r, "priority") : "", contract: g(r, "contract"),
+      contract_end: toISODate(g(r, "contract_end")), last_action: g(r, "last_action"), next_step: g(r, "next_step"), next_date: toISODate(g(r, "next_date")),
+      lost_reason: g(r, "lost_reason"), notes: g(r, "notes"), cname: g(r, "cname"), phone: g(r, "phone").split(/\s*\/\s*/)[0]
+    })).filter(x => x.name);
+    setSt(st, "جارٍ فحص التكرار…");
+    for (let i = 0; i < items.length; i += 10) await Promise.all(items.slice(i, i + 10).map(async x => {
+      x.exists = names.has(x.name); x.dup = x.phone ? await dupInfo(x.phone) : "";
+    }));
+    setSt(st, "");
+    importDrawer(items, Object.keys(map).length);
+  } catch (e) { setSt(st, "تعذّر قراءة الملف. تأكد أنه ملف Excel أو CSV صالح.", true); }
+};
+function importDrawer(items, nCols){
+  const el = $("#drawer"); openId = null;
+  const fresh = items.filter(x => !x.exists), dupN = fresh.filter(x => x.dup).length;
+  el.innerHTML = `
+    <button class="x" id="dx">إغلاق</button>
+    <div><div class="eyebrow">استيراد من Excel</div><h3>مراجعة قبل الاستيراد</h3></div>
+    <div class="box">
+      <p class="note">وجدت <b>${items.length}</b> صف (${nCols} عمود معروف). <b>${fresh.length}</b> عميل جديد، و<b>${items.length - fresh.length}</b> موجود مسبقاً بنفس الاسم وسيتم تخطيه${dupN ? `، و<b>${dupN}</b> رقمه مسجّل مسبقاً لدى الفريق` : ""}.</p>
+      ${dupN ? '<label class="chk"><input type="checkbox" id="imSkipDup" checked> تخطي العملاء الذين أرقامهم مسجّلة مسبقاً</label>' : ""}
+      ${isAdmin() ? `<div class="field"><label for="imOwner">الموظف المسؤول عن العملاء المستوردين</label><select id="imOwner">${Object.values(people).filter(p => p.active).map(p => `<option value="${esc(p.id)}" ${p.id === me.id ? "selected" : ""}>${esc(p.id === me.id ? "أنا" : (p.full_name || p.email))}</option>`).join("")}</select></div>` : ""}
+      <button class="btn" id="imGo" ${fresh.length ? "" : "disabled"}>استيراد العملاء الجدد</button>
+      <div class="status" id="imSt" role="status"></div>
+    </div>
+    <div class="box"><h4>معاينة الصفوف</h4>
+      ${items.slice(0, 40).map(x => `<div class="contact"><span><b>${esc(x.name)}</b> <small class="note">${esc([x.location, x.phone].filter(Boolean).join(" · "))}</small>${x.dup ? `<br><small class="status err">${esc(x.dup)}</small>` : ""}</span>
+        <span class="pill ${x.exists ? "stop" : x.dup ? "soon" : "ok"}">${x.exists ? "موجود - يُتخطّى" : x.dup ? "رقم مكرر" : "جديد"}</span></div>`).join("")}
+      ${items.length > 40 ? `<p class="note">و${items.length - 40} صف آخر…</p>` : ""}
+    </div>`;
+  el.hidden = false; $("#scrim").hidden = false;
+  $("#dx").onclick = closeDrawer;
+  $("#imGo").onclick = async () => {
+    const skip = $("#imSkipDup") ? $("#imSkipDup").checked : false;
+    const list = fresh.filter(x => !(skip && x.dup)), st = $("#imSt");
+    if (!list.length) return setSt(st, "لا يوجد عملاء للاستيراد.", true);
+    $("#imGo").disabled = true; setSt(st, `جارٍ استيراد ${list.length} عميل…`);
+    try {
+      const owner = $("#imOwner") ? $("#imOwner").value : me.id;
+      let order = deals.reduce((m, d) => Math.max(m, d.order || 0), 0);
+      const rows = list.map(x => ({ name: x.name, location: x.location, units: x.units, source: x.source, stage: x.stage, priority: x.priority, contract: x.contract,
+        contract_end: x.contract_end, last_action: x.last_action, next_step: x.next_step, next_date: x.next_date, lost_reason: LOST.has(x.stage) ? x.lost_reason : "",
+        notes: x.notes, sort_order: (x._o = ++order), owner_id: owner, updated_by: me.id }));
+      const { data, error } = await sb.from("deals").insert(rows).select("id, sort_order");
+      if (error) throw error;
+      const idBy = Object.fromEntries(data.map(r => [r.sort_order, r.id]));
+      const cs = list.filter(x => (x.cname || x.phone) && idBy[x._o]).map(x => ({ deal_id: idBy[x._o], name: x.cname, phone: x.phone, sort_order: 0 }));
+      if (cs.length) { const r = await sb.from("contacts").insert(cs); if (r.error) throw r.error; }
+      await load(); setSt($("#imSt"), `تم استيراد ${data.length} عميل.`); setSt($("#xlsSt"), `تم استيراد ${data.length} عميل من Excel.`);
+    } catch (e) { setSt(st, errMsg(e), true); $("#imGo").disabled = false; }
+  };
+}
+
 /* ================= تقرير PDF ================= */
 const NAVY = "#172A7E", TEAL = "#00B6AD", SKY = "#00AEEF";
 const TRI = `<i style="background:${NAVY}"></i><i style="background:${TEAL}"></i><i style="background:${SKY}"></i>`;
@@ -665,6 +1162,9 @@ function buildReport(scope){
   const phone = d => esc(d.contacts[0]?.phone || "");
   flowTable(ctx, "المتابعات المستحقة", [{h:"العميل / العقار",w:"27%"},{h:"الخطوة التالية",w:"29%"},{h:"الموعد",w:"15%"},{h:"الأولوية",w:"11%"},{h:"الجوال",w:"18%"}],
     q.slice().sort(sortQ).map(d => { const u = due(d); return `<td>${esc(d.name)}</td><td>${esc(d.nextStep || "—")}</td><td><span class="tag ${u.k}">${esc(d.nextDate ? (u.t === "اليوم" ? "اليوم" : d.nextDate) : "بلا موعد")}</span></td><td>${esc(d.priority || "—")}</td><td class="n">${phone(d)}</td>`; }));
+  const { renew } = queueParts();
+  if (renew.length) flowTable(ctx, "عقود تنتهي خلال 90 يوماً", [{h:"العميل / العقار",w:"30%"},{h:"انتهاء العقد",w:"16%"},{h:"المتبقي",w:"20%"},{h:"المرحلة",w:"16%"},{h:"الجوال",w:"18%"}],
+    renew.map(d => { const r = renewal(d); return `<td>${esc(d.name)}</td><td class="n">${esc(d.contractEnd)}</td><td><span class="tag ${r.k}">${esc(r.t)}</span></td><td>${esc(d.stage)}</td><td class="n">${phone(d)}</td>`; }));
   if (scope !== "queue") {
     const list = (scope === "open" ? open : deals).slice().sort((a,b) => a.order - b.order);
     flowTable(ctx, scope === "open" ? "العملاء المفتوحون" : "سجل العملاء", [{h:"العميل / العقار",w:"20%"},{h:"الموقع",w:"15%"},{h:"الوحدات",w:"9%"},{h:"المرحلة",w:"11%"},{h:"آخر إجراء",w:"17%"},{h:"الخطوة التالية",w:"16%"},{h:"الجوال",w:"12%"}],

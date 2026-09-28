@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' https://ptzmfrwjzfeslcqyjunb.supabase.co wss://ptzmfrwjzfeslcqyjunb.supabase.co; worker-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://ptzmfrwjzfeslcqyjunb.supabase.co; font-src 'self'; connect-src 'self' https://ptzmfrwjzfeslcqyjunb.supabase.co wss://ptzmfrwjzfeslcqyjunb.supabase.co; worker-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'">
 <meta name="referrer" content="no-referrer">
 <title>عملاء توتال</title>
 <meta name="description" content="نظام متابعة عملاء توتال لإدارة المرافق">
@@ -103,12 +103,13 @@
     <button role="tab" aria-selected="true" data-tab="queue">قائمة المتابعة</button>
     <button role="tab" aria-selected="false" data-tab="deals">كل العملاء</button>
     <button role="tab" aria-selected="false" data-tab="log">سجل النشاط</button>
+    <button role="tab" aria-selected="false" data-tab="dash" id="dashTab" hidden>لوحة الأداء</button>
     <button role="tab" aria-selected="false" data-tab="team" id="teamTab" hidden>الفريق</button>
     <button role="tab" aria-selected="false" data-tab="audit" id="auditTab" hidden>سجل المراقبة</button>
   </nav>
 
   <section id="p-queue">
-    <p class="note">كل عميل مفتوح بلا خطوة تالية، أو موعد خطوته اليوم أو قبله، أو خلال 7 أيام. اضغط على العميل لتسجيل ما حدث وتحديد الخطوة التالية.</p>
+    <p class="note">كل عميل مفتوح بلا خطوة تالية، أو موعد خطوته اليوم أو قبله، أو خلال 7 أيام، وكل عقد ينتهي خلال 90 يوماً. اضغط على العميل لتسجيل ما حدث وتحديد الخطوة التالية.</p>
     <div id="queue" class="list" style="margin-top:10px"></div>
   </section>
 
@@ -119,7 +120,11 @@
       <select id="fSrc" aria-label="تصفية حسب المصدر"><option value="">كل المصادر</option><option>من خلال الموظف</option><option>من خلال الشركة</option></select>
       <select id="fOwner" aria-label="تصفية حسب المسؤول" hidden></select>
       <button class="btn" id="newDeal">عميل جديد</button>
+      <button class="btn ghost" id="xlsOut">تصدير Excel</button>
+      <button class="btn ghost" id="xlsIn">استيراد Excel</button>
+      <input type="file" id="xlsFile" accept=".xlsx,.xls,.csv" hidden>
     </div>
+    <div class="status" id="xlsSt" role="status"></div>
     <div id="deals" class="list" style="margin-top:10px"></div>
   </section>
 
@@ -128,6 +133,11 @@
       <thead><tr><th>التاريخ</th><th>النوع</th><th>العميل</th><th>جهة التواصل</th><th>الملخص</th><th>بواسطة</th></tr></thead>
       <tbody id="log"></tbody>
     </table></div>
+  </section>
+
+  <section id="p-dash" hidden>
+    <p class="note">أداء الفريق وعروض الأسعار والعقود. تُحسب الأرقام من بيانات النظام مباشرة.</p>
+    <div id="dash" style="display:flex;flex-direction:column;gap:14px;margin-top:10px"></div>
   </section>
 
   <section id="p-team" hidden>
