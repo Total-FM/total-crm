@@ -1,5 +1,5 @@
 // يخزّن واجهة التطبيق ليفتح بسرعة. بيانات العملاء لا تُخزَّن هنا؛ تأتي دائماً من الخادم.
-const CACHE = "total-crm-v2";
+const CACHE = "total-crm-v3";
 const SHELL = ["./", "index.html", "style.css", "app.js", "config.js", "manifest.webmanifest",
   "vendor/supabase.js", "icons/logo.png", "icons/icon-192.png", "icons/icon-512.png",
   "vendor/tajawal-arabic-400-normal.woff2", "vendor/tajawal-arabic-700-normal.woff2", "vendor/tajawal-arabic-800-normal.woff2"];

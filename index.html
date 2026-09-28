@@ -117,6 +117,7 @@
       <input type="search" id="q" placeholder="ابحث بالاسم أو الحي أو الجوال">
       <select id="fStage" aria-label="تصفية حسب المرحلة"><option value="">كل المراحل</option></select>
       <select id="fSrc" aria-label="تصفية حسب المصدر"><option value="">كل المصادر</option><option>من خلال الموظف</option><option>من خلال الشركة</option></select>
+      <select id="fOwner" aria-label="تصفية حسب المسؤول" hidden></select>
       <button class="btn" id="newDeal">عميل جديد</button>
     </div>
     <div id="deals" class="list" style="margin-top:10px"></div>
@@ -144,7 +145,7 @@
     </div>
     <div class="box" style="margin-top:12px">
       <h4>أعضاء الفريق</h4>
-      <p class="note">أوقف حساب أي موظف يغادر الشركة فوراً، فيفقد الوصول للبيانات مباشرة.</p>
+      <p class="note">كل موظف يرى العملاء المسؤول عنهم فقط. لإطلاعه على عملاء موظف آخر أو كل العملاء، أعطه صلاحية قراءة فقط أو قراءة وتعديل. أوقف حساب أي موظف يغادر الشركة فيفقد الوصول فوراً.</p>
       <div id="team"></div>
       <div class="status" id="teamSt" role="status"></div>
     </div>

@@ -12,7 +12,14 @@ const TYPES = ["اتصال","واتساب","اجتماع","معاينة","عرض
 const SOURCES = ["من خلال الشركة","من خلال الموظف"];
 const PR = {"عالية":0,"متوسطة":1,"منخفضة":2,"":3};
 
-let me = null, profile = null, deals = [], acts = [], people = {}, tab = "queue", openId = null, confirmDel = false, booted = false;
+let me = null, profile = null, deals = [], acts = [], people = {}, grants = [], tab = "queue", openId = null, confirmDel = false, booted = false;
+const isAdmin = () => !!profile && profile.role === "admin";
+// مستوى صلاحيتي على عميل: 2 تعديل، 1 قراءة فقط. قاعدة البيانات تفرض نفس القاعدة، وهذا لعرض الشاشة فقط.
+function levelOf(d){
+  if (isAdmin() || d.ownerId === me.id) return 2;
+  return grants.filter(g => g.grantee === me.id && (g.owner_id === d.ownerId || g.owner_id === null))
+               .reduce((m, g) => Math.max(m, g.level === "edit" ? 2 : 1), 0) || 1;
+}
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -153,17 +160,19 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && bo
 function mapDeal(r){
   return { id: r.id, order: r.sort_order, name: r.name, location: r.location, units: r.units, contract: r.contract, source: r.source,
     stage: r.stage, priority: r.priority || "", lastAction: r.last_action, nextStep: r.next_step, nextDate: r.next_date || "",
-    dateBasis: r.date_basis, lastActivity: r.last_activity || "", notes: r.notes, updatedAt: r.updated_at, updatedBy: r.updated_by,
+    dateBasis: r.date_basis, lastActivity: r.last_activity || "", notes: r.notes, updatedAt: r.updated_at, updatedBy: r.updated_by, ownerId: r.owner_id,
     contacts: (r.contacts || []).sort((a,b) => a.sort_order - b.sort_order) };
 }
 async function load(){
   try {
-    const [d, a, p] = await Promise.all([
+    const [d, a, p, g] = await Promise.all([
       sb.from("deals").select("*, contacts(*)").order("sort_order"),
       sb.from("activity").select("*").order("date", { ascending: false }).order("created_at", { ascending: false }).limit(1000),
-      sb.from("profiles").select("id, email, full_name, role, active, created_at").order("created_at")
+      sb.from("profiles").select("id, email, full_name, role, active, created_at").order("created_at"),
+      sb.from("access_grants").select("*").order("created_at")
     ]);
     if (d.error) throw d.error; if (a.error) throw a.error;
+    grants = g.error ? [] : (g.data || []);
     deals = d.data.map(mapDeal);
     const byId = Object.fromEntries(deals.map(x => [x.id, x]));
     acts = a.data.map(r => ({ id: r.id, dealId: r.deal_id, dealName: byId[r.deal_id]?.name || "", date: r.date, type: r.type, contact: r.contact, summary: r.summary, createdBy: r.created_by, createdAt: r.created_at }));
@@ -193,7 +202,7 @@ function rowHTML(d){
   return `<button class="row" data-id="${esc(d.id)}">
     <div><div class="nm">${esc(d.name)}</div><div class="sub">${esc([d.location, d.units && ("الوحدات: " + d.units)].filter(Boolean).join(" · ") || (c ? c.phone : ""))}</div></div>
     <div><div class="nx">${d.nextStep ? esc(d.nextStep) : '<span class="sub">لا توجد خطوة تالية</span>'}</div><div class="sub">${esc(d.lastAction || "")}</div></div>
-    <div class="meta">${d.priority ? `<span class="pill ${d.priority === "عالية" ? "hi" : ""}">${esc(d.priority)}</span>` : ""}${stagePill(d.stage)}${u ? `<span class="pill ${u.k}">${esc(u.t)}</span>` : ""}</div>
+    <div class="meta">${d.ownerId !== me.id ? `<span class="pill own">${esc(who(d.ownerId) || "—")}</span>` : ""}${levelOf(d) < 2 ? '<span class="pill stop">قراءة فقط</span>' : ""}${d.priority ? `<span class="pill ${d.priority === "عالية" ? "hi" : ""}">${esc(d.priority)}</span>` : ""}${stagePill(d.stage)}${u ? `<span class="pill ${u.k}">${esc(u.t)}</span>` : ""}</div>
   </button>`;
 }
 const sortQ = (a,b) => (PR[a.priority||""] - PR[b.priority||""]) || ((a.nextDate||"0") < (b.nextDate||"0") ? -1 : (a.nextDate||"0") > (b.nextDate||"0") ? 1 : 0) || a.order - b.order;
@@ -213,8 +222,15 @@ function render(){
   const grp = (t, l) => l.length ? `<div class="group"><h2>${t} · ${l.length}</h2>${l.slice().sort(sortQ).map(rowHTML).join("")}</div>` : "";
   $("#queue").innerHTML = (grp("مستحقة الآن", dueNow) + grp("هذا الأسبوع", soon) + grp("بلا موعد متابعة", noDate)) || `<div class="empty">لا توجد متابعات مستحقة.</div>`;
 
-  const s = $("#q").value.trim(), fs = $("#fStage").value, fr = $("#fSrc").value;
-  const list = deals.filter(d => (!fs || d.stage === fs) && (!fr || d.source === fr) &&
+  // فلتر المسؤول يظهر فقط إذا كان المستخدم يرى عملاء أكثر من موظف
+  const owners = [...new Set(deals.map(d => d.ownerId))];
+  const fo = $("#fOwner");
+  fo.hidden = owners.length < 2;
+  const keep = fo.value;
+  fo.innerHTML = `<option value="">كل المسؤولين</option>` + owners.map(o => `<option value="${esc(o)}">${esc(o === me.id ? "عملائي" : (who(o) || "—"))}</option>`).join("");
+  fo.value = owners.includes(keep) ? keep : "";
+  const s = $("#q").value.trim(), fs = $("#fStage").value, fr = $("#fSrc").value, fw = fo.value;
+  const list = deals.filter(d => (!fs || d.stage === fs) && (!fr || d.source === fr) && (!fw || d.ownerId === fw) &&
     (!s || [d.name, d.location, d.notes, ...d.contacts.flatMap(c => [c.name, c.phone])].join(" ").includes(s)));
   $("#deals").innerHTML = list.map(rowHTML).join("") || `<div class="empty">لا يوجد عميل مطابق.</div>`;
 
@@ -238,7 +254,7 @@ document.addEventListener("click", e => {
     (navigator.clipboard ? navigator.clipboard.writeText(v) : Promise.reject()).then(() => { cp.textContent = "نُسخ"; }, () => {});
   }
 });
-["#q","#fStage","#fSrc"].forEach(s => $(s).addEventListener("input", render));
+["#q","#fStage","#fSrc","#fOwner"].forEach(s => $(s).addEventListener("input", render));
 $("#scrim").addEventListener("click", closeDrawer);
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
 function closeDrawer(){ openId = null; $("#drawer").hidden = true; $("#scrim").hidden = true; }
@@ -250,11 +266,16 @@ function drawer(id, refresh){
   if (refresh && el.contains(document.activeElement) && document.activeElement.matches("input,textarea,select")) return;
   openId = id;
   const hist = acts.filter(a => a.dealId === id);
-  const isAdmin = profile && profile.role === "admin";
+  const admin = isAdmin(), canEdit = levelOf(d) >= 2;
+  const members = Object.values(people).filter(p => p.active);
   el.innerHTML = `
     <button class="x" id="dx">إغلاق</button>
     <div><div class="eyebrow">${esc(d.source || "")}</div><h3>${esc(d.name)}</h3></div>
+    ${canEdit ? "" : '<p class="note" style="background:var(--card);padding:8px 12px;border-radius:8px">لديك صلاحية <b>قراءة فقط</b> على هذا العميل. للتعديل اطلب الصلاحية من المدير.</p>'}
     <dl class="facts">
+      <dt>المسؤول</dt><dd>${admin
+        ? `<select id="dOwner" aria-label="الموظف المسؤول">${members.map(p => `<option value="${esc(p.id)}" ${p.id === d.ownerId ? "selected" : ""}>${esc(p.full_name || p.email)}</option>`).join("")}</select>`
+        : esc(d.ownerId === me.id ? "أنت" : (who(d.ownerId) || "—"))}</dd>
       ${d.location ? `<dt>الموقع</dt><dd>${esc(d.location)}</dd>` : ""}
       ${d.units ? `<dt>الوحدات</dt><dd>${esc(d.units)}</dd>` : ""}
       ${d.contract ? `<dt>العقد الحالي</dt><dd>${esc(d.contract)}</dd>` : ""}
@@ -264,15 +285,15 @@ function drawer(id, refresh){
     </dl>
     <div class="box"><h4>جهات التواصل</h4>
       ${d.contacts.map(c => `<div class="contact"><span>${esc(c.name)}${c.role ? ` <small class="note">(${esc(c.role)})</small>` : ""}</span>
-        <span><span class="phone">${esc(c.phone)}</span> <button class="btn ghost" data-copy="${esc(c.phone)}">نسخ</button> <button class="btn ghost" data-delc="${esc(c.id)}" aria-label="حذف جهة التواصل">حذف</button></span></div>`).join("") || '<span class="note">لا توجد جهة تواصل مسجلة.</span>'}
-      <div class="three">
+        <span><span class="phone">${esc(c.phone)}</span> <button class="btn ghost" data-copy="${esc(c.phone)}">نسخ</button>${canEdit ? ` <button class="btn ghost" data-delc="${esc(c.id)}" aria-label="حذف جهة التواصل">حذف</button>` : ""}</span></div>`).join("") || '<span class="note">لا توجد جهة تواصل مسجلة.</span>'}
+      <div class="three" ${canEdit ? "" : "hidden"}>
         <div class="field"><label for="cName">الاسم</label><input id="cName"></div>
         <div class="field"><label for="cPhone">الجوال</label><input id="cPhone" inputmode="tel" dir="ltr"></div>
         <div class="field"><label for="cRole">الصفة</label><input id="cRole" placeholder="مالك، رئيس الجمعية…"></div>
         <button class="btn ghost" id="addC">إضافة</button>
       </div>
     </div>
-    <div class="box"><h4>تسجيل ما حدث</h4>
+    <div class="box" ${canEdit ? "" : "hidden"}><h4>تسجيل ما حدث</h4>
       <div class="two">
         <div class="field"><label for="aType">النوع</label><select id="aType">${TYPES.map(t => `<option>${t}</option>`).join("")}</select></div>
         <div class="field"><label for="aDate">التاريخ</label><input type="date" id="aDate" value="${T}"></div>
@@ -291,13 +312,19 @@ function drawer(id, refresh){
       <div class="status" id="st" role="status"></div>
     </div>
     <div class="box"><h4>السجل</h4><div class="hist">${hist.map(a => `<div><small>${esc(a.date)} · ${esc(a.type)}${a.createdBy ? " · " + esc(who(a.createdBy)) : ""}</small><br>${esc(a.summary)}</div>`).join("") || '<span class="note">لا يوجد نشاط مسجل.</span>'}</div></div>
-    ${isAdmin ? `<div class="box"><h4>حذف العميل</h4>${confirmDel
+    ${admin ? `<div class="box"><h4>حذف العميل</h4>${confirmDel
       ? `<p class="note">سيُحذف العميل وجهات تواصله وسجله نهائياً.</p><div class="tools"><button class="btn danger" id="delYes">تأكيد الحذف</button><button class="btn ghost" id="delNo">إلغاء</button></div>`
       : `<button class="btn ghost" id="delDeal">حذف هذا العميل</button>`}</div>` : ""}`;
   el.hidden = false; $("#scrim").hidden = false;
   $("#dx").onclick = closeDrawer;
   $("#save").onclick = () => save(d);
   $("#addC").onclick = () => addContact(d);
+  if ($("#dOwner")) $("#dOwner").onchange = async e => {
+    const to = e.target.value, st = $("#st");
+    const { error } = await sb.from("deals").update({ owner_id: to }).eq("id", d.id);
+    if (error) { e.target.value = d.ownerId; return setSt(st, errMsg(error), true); }
+    await load(); setSt($("#st"), `نُقل العميل إلى ${who(to)}.`);
+  };
   el.querySelectorAll("[data-delc]").forEach(b => b.onclick = () => delContact(b.dataset.delc));
   if ($("#delDeal")) $("#delDeal").onclick = () => { confirmDel = true; drawer(id); };
   if ($("#delNo")) $("#delNo").onclick = () => { confirmDel = false; drawer(id); };
@@ -361,6 +388,7 @@ $("#newDeal").onclick = () => {
         <div class="field"><label for="ndPr">الأولوية</label><select id="ndPr"><option value="">—</option><option>عالية</option><option>متوسطة</option><option>منخفضة</option></select></div>
       </div>
       <div class="field"><label for="ndContract">العقد الحالي</label><input id="ndContract" placeholder="مثال: عقد ينتهي 12-2026"></div>
+      ${isAdmin() ? `<div class="field"><label for="ndOwner">الموظف المسؤول</label><select id="ndOwner">${Object.values(people).filter(p => p.active).map(p => `<option value="${esc(p.id)}" ${p.id === me.id ? "selected" : ""}>${esc(p.id === me.id ? "أنا" : (p.full_name || p.email))}</option>`).join("")}</select></div>` : ""}
       <div class="two">
         <div class="field"><label for="ndCName">جهة التواصل</label><input id="ndCName"></div>
         <div class="field"><label for="ndCPhone">الجوال</label><input id="ndCPhone" inputmode="tel" dir="ltr"></div>
@@ -384,7 +412,8 @@ $("#newDeal").onclick = () => {
       const { data, error } = await sb.from("deals").insert({
         name, location: $("#ndLoc").value.trim(), units: $("#ndUnits").value.trim(), source: $("#ndSrc").value, priority: $("#ndPr").value,
         contract: $("#ndContract").value.trim(), next_step: $("#ndStep").value.trim(), next_date: $("#ndDate").value || null,
-        notes: $("#ndNotes").value.trim(), stage: "جديد", sort_order: order, updated_by: me.id
+        notes: $("#ndNotes").value.trim(), stage: "جديد", sort_order: order, updated_by: me.id,
+        owner_id: $("#ndOwner") ? $("#ndOwner").value : me.id
       }).select("id").single();
       if (error) throw error;
       const cn = $("#ndCName").value.trim(), cp = $("#ndCPhone").value.trim();
@@ -535,14 +564,47 @@ $("#account").onclick = () => accountDrawer();
 function renderTeam(){
   renderInvites();
   const list = Object.values(people);
-  $("#team").innerHTML = list.map(p => `<div class="team-row">
-      <div><b>${esc(p.full_name || "—")}</b><div class="note" dir="ltr" style="text-align:right">${esc(p.email)}</div></div>
+  const owned = id => deals.filter(d => d.ownerId === id).length;
+  const LV = { read: "قراءة فقط", edit: "قراءة وتعديل" };
+  $("#team").innerHTML = list.map(p => {
+    const mine = grants.filter(g => g.grantee === p.id);
+    const others = list.filter(o => o.id !== p.id);
+    const showAccess = p.id !== me.id && p.active && p.role !== "admin";
+    return `<div class="team-row" style="grid-template-columns:minmax(0,1fr) auto auto">
+      <div><b>${esc(p.full_name || "—")}</b><div class="note" dir="ltr" style="text-align:right">${esc(p.email)}</div>
+        <div class="note">مسؤول عن ${owned(p.id)} عميل</div></div>
       <span class="pill ${p.active ? "ok" : "soon"}">${p.active ? (p.role === "admin" ? "مدير" : "مفعّل") : "بانتظار التفعيل"}</span>
       ${p.id === me.id ? '<span class="note">أنت</span>' : `<div class="tools">
         <button class="btn ghost" data-act="${p.active ? "off" : "on"}" data-uid="${esc(p.id)}">${p.active ? "إيقاف" : "تفعيل"}</button>
         ${p.active ? `<button class="btn ghost" data-act="${p.role === "admin" ? "member" : "admin"}" data-uid="${esc(p.id)}">${p.role === "admin" ? "إلغاء الإدارة" : "جعله مديراً"}</button>` : ""}
       </div>`}
-    </div>`).join("") || '<p class="note">لا يوجد أعضاء بعد.</p>';
+      ${showAccess ? `<div style="grid-column:1/-1;background:var(--card);border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:8px">
+        <b style="font-size:13px;color:var(--teal)">يرى بالإضافة لعملائه</b>
+        ${mine.map(g => `<div class="contact"><span>${g.owner_id ? "عملاء " + esc(who(g.owner_id) || "—") : "<b>كل العملاء</b>"} · <span class="pill ${g.level === "edit" ? "ok" : "stop"}">${LV[g.level]}</span></span>
+          <button class="btn ghost" data-ungrant="${esc(g.id)}">إزالة</button></div>`).join("") || '<span class="note">لا يرى إلا عملاءه فقط.</span>'}
+        <div class="tools">
+          <select data-gowner="${esc(p.id)}" aria-label="عملاء من"><option value="">كل العملاء</option>${others.map(o => `<option value="${esc(o.id)}">عملاء ${esc(o.full_name || o.email)}</option>`).join("")}</select>
+          <select data-glevel="${esc(p.id)}" aria-label="نوع الصلاحية"><option value="read">قراءة فقط</option><option value="edit">قراءة وتعديل</option></select>
+          <button class="btn ghost" data-grant="${esc(p.id)}">إعطاء الصلاحية</button>
+        </div>
+      </div>` : ""}
+    </div>`;
+  }).join("") || '<p class="note">لا يوجد أعضاء بعد.</p>';
+  $("#team").querySelectorAll("[data-grant]").forEach(b => b.onclick = async () => {
+    const uid = b.dataset.grant, owner = $(`[data-gowner="${uid}"]`).value || null, level = $(`[data-glevel="${uid}"]`).value;
+    b.disabled = true;
+    const exist = grants.find(g => g.grantee === uid && g.owner_id === owner);
+    const r = exist ? await sb.from("access_grants").update({ level }).eq("id", exist.id)
+                    : await sb.from("access_grants").insert({ grantee: uid, owner_id: owner, level });
+    if (r.error) setSt($("#teamSt"), errMsg(r.error), true); else setSt($("#teamSt"), "تم تحديث الصلاحية.");
+    await load();
+  });
+  $("#team").querySelectorAll("[data-ungrant]").forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    const { error } = await sb.from("access_grants").delete().eq("id", b.dataset.ungrant);
+    if (error) setSt($("#teamSt"), errMsg(error), true); else setSt($("#teamSt"), "أُزيلت الصلاحية.");
+    await load();
+  });
   $("#team").querySelectorAll("[data-act]").forEach(b => b.onclick = async () => {
     const a = b.dataset.act, upd = a === "on" ? { active: true } : a === "off" ? { active: false } : { role: a };
     b.disabled = true;
